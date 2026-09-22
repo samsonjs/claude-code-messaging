@@ -1,0 +1,3 @@
+interface:
+  display_name: "Claude Code Messaging"
+  short_description: "Talk to running local Claude Code sessions"
