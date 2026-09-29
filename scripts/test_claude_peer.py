@@ -134,6 +134,25 @@ class ReplyLifetimeTests(unittest.TestCase):
         self.assertGreater(rows[-1]['cursor'], cursor)
         self.assertTrue(rows[-1]['open'])
 
+    def test_followup_send_does_not_hide_the_unread_backlog(self):
+        process, frame, sent = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        self.reply(frame['from'], 'The handoff arrived while Codex was idle.')
+        self.read_messages(sent['inbox'])
+
+        followup, _, second_sent = self.start_send(wait='0', inbox=sent['inbox'])
+        followup.communicate(timeout=5)
+        self.assertEqual(second_sent['cursor'], 1)
+        state = json.loads(self.cli('inboxes').stdout)
+        self.assertEqual(state['acknowledged_cursor'], 0)
+        self.assertEqual(state['unread_count'], 1)
+        self.assertFalse(second_sent['receiver_wakes_agent'])
+        unread = self.cli('read', '--inbox', sent['inbox'], '--unread')
+        rows = [json.loads(line) for line in unread.stdout.splitlines()]
+        self.assertEqual(rows[0]['frame']['message']['content'],
+                         'The handoff arrived while Codex was idle.')
+        self.assertTrue(rows[-1]['open'])
+
     def test_cancelling_foreground_wait_preserves_reply_inbox(self):
         process, frame, sent = self.start_send(wait='5')
         process.send_signal(signal.SIGINT)
@@ -154,6 +173,58 @@ class ReplyLifetimeTests(unittest.TestCase):
         self.assertFalse(Path(frame['from'][4:]).exists())
         rows = self.read_messages(sent['inbox'])
         self.assertEqual(rows[0]['frame']['message']['content'], 'Keep this reply after closing.')
+        self.assertFalse(rows[-1]['open'])
+        self.inboxes.discard(sent['inbox'])
+
+    def test_unread_replies_survive_reads_until_explicitly_acknowledged(self):
+        process, frame, sent = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        self.reply(frame['from'], 'The build needs your review.')
+        delivered = self.read_messages(sent['inbox'])
+        cursor = delivered[-1]['cursor']
+
+        for _ in range(2):
+            result = self.cli('read', '--inbox', sent['inbox'], '--unread')
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            rows = [json.loads(line) for line in result.stdout.splitlines()]
+            self.assertEqual(rows[0]['frame']['message']['content'],
+                             'The build needs your review.')
+
+        acknowledged = self.cli('ack', '--inbox', sent['inbox'], '--through', str(cursor))
+        self.assertEqual(acknowledged.returncode, 0, acknowledged.stdout + acknowledged.stderr)
+        result = self.cli('read', '--inbox', sent['inbox'], '--unread')
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([row['event'] for row in rows], ['read_complete'])
+        self.assertEqual(rows[0]['acknowledged_cursor'], cursor)
+
+        self.reply(frame['from'], 'A later handoff also needs attention.')
+        result = self.cli('read', '--inbox', sent['inbox'], '--unread', '--wait', '1')
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(rows[0]['frame']['message']['content'],
+                         'A later handoff also needs attention.')
+        self.assertGreater(rows[-1]['cursor'], cursor)
+
+    def test_acknowledgement_cannot_skip_future_messages_or_move_backwards(self):
+        process, frame, sent = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        self.reply(frame['from'], 'First review result.')
+        self.read_messages(sent['inbox'])
+        result = self.cli('ack', '--inbox', sent['inbox'], '--through', '2')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(json.loads(self.cli('inboxes').stdout)['acknowledged_cursor'], 0)
+        result = self.cli('ack', '--inbox', sent['inbox'], '--through', '1')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.cli('ack', '--inbox', sent['inbox'], '--through', '0')
+        self.assertEqual(json.loads(result.stdout)['cursor'], 1)
+
+        self.reply(frame['from'], 'Second review result.')
+        self.read_messages(sent['inbox'], after=1)
+        result = self.cli('close', '--inbox', sent['inbox'])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.cli('read', '--inbox', sent['inbox'], '--unread')
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(rows[0]['frame']['message']['content'], 'Second review result.')
+        self.assertEqual(rows[-1]['acknowledged_cursor'], 1)
         self.assertFalse(rows[-1]['open'])
         self.inboxes.discard(sent['inbox'])
 

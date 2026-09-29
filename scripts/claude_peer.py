@@ -2,6 +2,7 @@
 """Exchange messages with local Claude Code sessions using persistent reply inboxes."""
 import argparse
 import datetime
+import fcntl
 import json
 import math
 import os
@@ -194,6 +195,31 @@ def messages(inbox, after):
     return result
 
 
+def acknowledged_cursor(inbox):
+    path = inbox_directory(inbox) / 'acknowledged.json'
+    if not path.exists():
+        return 0
+    return json.loads(path.read_text())['cursor']
+
+
+def acknowledge(inbox, through):
+    directory = inbox_directory(inbox)
+    inbox_state(inbox)
+    with (directory / 'acknowledged.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        previous = acknowledged_cursor(inbox)
+        rows = messages(inbox, 0)
+        latest = rows[-1]['seq'] if rows else 0
+        if through < 0 or through > latest:
+            raise ValueError(f'--through must be between 0 and the latest received cursor ({latest})')
+        cursor = max(previous, through)
+        temporary = directory / f'acknowledged-{os.getpid()}.tmp'
+        temporary.write_text(json.dumps({'cursor': cursor, 'at': now()}) + '\n')
+        temporary.replace(directory / 'acknowledged.json')
+    emit({'event': 'acknowledged', 'inbox': inbox, 'cursor': cursor})
+    return 0
+
+
 def wait_messages(inbox, after, seconds):
     deadline = time.monotonic() + seconds
     while True:
@@ -255,6 +281,7 @@ def send(args):
     record({
         'event': 'sent', 'to': target['name'], 'pid': target['pid'], 'msg_id': message_id,
         'inbox': inbox, 'reply_address': address, 'cursor': cursor,
+        'acknowledged_cursor': acknowledged_cursor(inbox), 'receiver_wakes_agent': False,
         'text': text, 'log': str(log), 'inbox_log': state['log'],
     })
     if not args.wait:
@@ -282,12 +309,14 @@ def send(args):
 
 def read(args):
     inbox_state(args.inbox)
-    rows = wait_messages(args.inbox, args.after, args.wait)
+    after = acknowledged_cursor(args.inbox) if args.unread else (args.after or 0)
+    rows = wait_messages(args.inbox, after, args.wait)
     for row in rows:
         emit(row)
     state = inbox_state(args.inbox)
     emit({'event': 'read_complete', 'inbox': args.inbox,
-          'cursor': rows[-1]['seq'] if rows else args.after,
+          'cursor': rows[-1]['seq'] if rows else after,
+          'acknowledged_cursor': acknowledged_cursor(args.inbox),
           'open': inbox_open(state), 'reply_address': state.get('reply_address')})
     return 0
 
@@ -327,8 +356,14 @@ def main():
                       help='Foreground wait in seconds; 0 returns immediately. Inbox stays open.')
     reader = sub.add_parser('read', help='Read replies without resending')
     reader.add_argument('--inbox', required=True)
-    reader.add_argument('--after', type=int, default=0, help='Only messages after this cursor')
+    read_position = reader.add_mutually_exclusive_group()
+    read_position.add_argument('--after', type=int, help='Only messages after this cursor (default: 0)')
+    read_position.add_argument('--unread', action='store_true',
+                               help='Read after the durable acknowledged cursor; does not acknowledge')
     reader.add_argument('--wait', type=duration, default=0, help='Seconds to await a new message')
+    acknowledger = sub.add_parser('ack', help='Mark replies handled through an observed cursor')
+    acknowledger.add_argument('--inbox', required=True)
+    acknowledger.add_argument('--through', type=int, required=True)
     closer = sub.add_parser('close', help='Stop an inbox receiver; preserve saved messages')
     closer.add_argument('--inbox', required=True)
     receiver = sub.add_parser('_serve', help=argparse.SUPPRESS)
@@ -342,12 +377,17 @@ def main():
     if args.command == 'inboxes':
         for path in sorted((OUTPUT / 'inboxes').glob('*/state.json')):
             state = json.loads(path.read_text())
-            emit({**state, 'open': inbox_open(state)})
+            cursor = acknowledged_cursor(state['inbox'])
+            unread = messages(state['inbox'], cursor)
+            emit({**state, 'open': inbox_open(state), 'acknowledged_cursor': cursor,
+                  'unread_count': len(unread), 'receiver_wakes_agent': False})
         return 0
     if args.command == 'read':
-        if args.after < 0:
+        if args.after is not None and args.after < 0:
             raise ValueError('--after must be non-negative')
         return read(args)
+    if args.command == 'ack':
+        return acknowledge(args.inbox, args.through)
     if args.command == 'close':
         return close(args.inbox)
     if args.command == '_serve':
