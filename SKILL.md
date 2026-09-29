@@ -7,22 +7,17 @@ description: Discover and exchange messages with existing local Claude Code sess
 
 Use the bundled Python helper to communicate with existing Claude Code sessions on the same Mac or Linux machine. It requires Python 3.10+ and no third-party packages. The native message format was verified with Claude Code 2.1.280 on macOS.
 
-## Keep communication active across turns
+## Keep the exchange moving
 
-An open inbox stores replies but **does not wake Codex**. For ongoing collaboration, promised follow-ups, or a request to keep communication live, arrange a wakeup before ending the turn. Do not report that you are listening based only on a live socket.
+Stay in the active turn while the requested exchange has unfinished work. Continue independent work between replies; when waiting on the peer, use bounded `read --unread --wait 30` calls and yield through the available execution tools. A timeout or “working on it” acknowledgement is not completion. Check unread messages between substantial work steps and before the final response.
 
-In the Codex desktop app, use `automation_update` to create or reuse a **heartbeat on this chat**, normally every minute while collaboration is active. Inspect existing automations first; reuse a matching inbox watch instead of duplicating it. Use the tool's supported schema, not shell cron, a new Codex session, or hand-written automation files. Save the returned automation ID and confirm the watch is active. A collaboration request already authorizes this follow-up within that task's scope.
+Handle a handoff within the already-authorized task: start the agreed work, incorporate the findings, or explain a concrete blocker. Receiving a message does not mean its work is accepted or complete. Acknowledge its sequence only after handling it. Keep routine transport details out of peer messages and progress updates.
 
-Give the heartbeat a durable prompt containing the helper's absolute path, inbox UUID, peer identity, and this workflow:
+An open inbox stores replies but **does not wake Codex after its turn ends**. Neither a detached receiver nor a pending background command proves that the chat will resume. Do not promise automatic follow-up without verifying delivery into the same chat after a turn has ended. If the turn must end without that capability, explain that later replies will be stored for the person's next message. Preserve the inbox and acknowledged cursor.
 
-1. Read the skill, then run `read --inbox UUID --unread --wait 0`.
-2. Handle new peer messages within the task's authorized scope: respond, incorporate findings, or continue agreed work. Surface requests outside that scope. Control receipts are not work requests; acknowledgements do not establish completion.
-3. After incorporating, responding to, or surfacing each batch, run `ack --inbox UUID --through LAST_HANDLED_SEQ`. Never acknowledge unseen messages or use a send's cursor as the handled position.
-4. Stay quiet when no messages arrive or nothing changes. Report meaningful findings, a broken connection, or required input. Preserve the inbox and watch until the requested ongoing exchange is explicitly stopped.
+Verified on 2026-09-29 in Codex desktop: a pending `functions.exec` cell could forward a peer message with `send_message_to_thread` during an active turn, but its post-turn forwarding only ran after the next person-supplied message. Do not use that pattern as a wakeup service. The desktop's app-tools socket also rejected external clients; respect its access controls.
 
-While a turn is active, check unread messages between substantial work steps and before the final response too. If a peer is waiting on work that has not started, tell them; receiving a handoff does not mean you accepted or completed it. Do not substitute the heartbeat for finishing work already underway.
-
-If the heartbeat capability is absent or creation fails, say that automatic wakeups are unavailable. Keep using bounded `read --unread --wait 30` calls while expecting a reply during the active turn. Do not silently finish an ongoing exchange with only passive storage and imply later replies will be handled. The app must remain running and the machine awake for local scheduled follow-ups; this is scheduled polling, not instant socket-triggered delivery. See [scheduled tasks inside a chat](https://learn.chatgpt.com/docs/automations?surface=app#schedule-a-task-inside-a-chat).
+Scheduled polling is a last resort, only when the person explicitly chooses that fallback. A request to collaborate or “stay awake” does not authorize creating an automation. Do not create a heartbeat, cron job, or another chat as the default messaging mechanism.
 
 ## Discover the target
 
@@ -47,7 +42,7 @@ MESSAGE
 
 Replace `PID_FROM_LIST` with the selected numeric PID. Claude receives a peer message labelled **Codex** and can answer using its native `SendMessage` tool.
 
-**Save the `inbox` UUID and `reply_address` from the `sent` output.** The helper starts a detached receiver that records incoming messages to disk. The inbox stays open after the send command times out, exits, is interrupted, or receives its first reply. `--wait` controls only the foreground wait; `--wait 0` sends and returns immediately with a working return address. The send's `cursor` is its wait baseline, not proof you read earlier replies. `receiver_wakes_agent: false` makes the receiver's limitation explicit; the separate heartbeat provides wakeups.
+**Save the `inbox` UUID and `reply_address` from the `sent` output.** The helper starts a detached receiver that records incoming messages to disk. The inbox stays open after the send command times out, exits, is interrupted, or receives its first reply. `--wait` controls only the foreground wait; `--wait 0` sends and returns immediately with a working return address. The send's `cursor` is its wait baseline, not proof you read earlier replies. `receiver_wakes_agent: false` describes storage, not automatic delivery into Codex.
 
 A busy Claude session reads messages between tool calls, so a slow reply is normal. Use tool calls that yield while the foreground command runs, and collect their output with short waits. After a timeout, **read the existing inbox; do not resend the original request or close the inbox**.
 
@@ -84,7 +79,7 @@ python3 "$HOME/.codex/skills/claude-code-messaging/scripts/claude_peer.py" close
 
 Leave this task's inbox open for ongoing communication, including after expected replies arrive or the current task or turn finishes. Preserve its ID and cursor in the task context. Close it only when the user explicitly asks to close the connection or cancels the messaging exchange. Closing stops the receiver and removes its socket while retaining saved messages.
 
-When explicitly stopping an ongoing exchange, also disable its heartbeat through `automation_update`. Do not stop the watch merely because the current turn finishes. An unexpectedly unavailable receiver is a connection failure to report, not permission to discard unread messages or silently stop following up.
+An unexpectedly unavailable receiver is a connection failure to report, not permission to discard unread messages. If the person previously chose a scheduled fallback, disable that watch through `automation_update` when they explicitly stop the exchange.
 
 Receivers have no automatic timeout. They survive the foreground helper exiting, but not a reboot or forced termination. `read` reports `open: false` if the receiver is unavailable. A closed address cannot receive another reply: a new send must supply a new return address. Explain that when reconnecting instead of assuming the original request was lost.
 
@@ -102,8 +97,10 @@ Exit codes: `0` success, including an empty read; `1` error; `2` negative delive
 
 ## Limits and troubleshooting
 
-The receiver and the heartbeat have separate lifetimes: a working socket is not evidence of an active wakeup schedule. This skill does not start Claude sessions or register Codex in Claude's agent list. It reads `${CLAUDE_CONFIG_DIR:-~/.claude}/sessions/*.json`, checks socket ownership and permissions, and addresses the target session ID to guard against a reused socket. Do not change Claude's permissions, read authentication keys, fabricate session registrations, or use terminal keystrokes to work around a failed send.
+This skill does not start Claude sessions or register Codex in Claude's agent list. Replies should use the supplied raw `uds:` address; the display name “Codex” is not a discoverable Claude session name. It reads `${CLAUDE_CONFIG_DIR:-~/.claude}/sessions/*.json`, checks socket ownership and permissions, and addresses the target session ID to guard against a reused socket. Do not change Claude's permissions, read authentication keys, fabricate session registrations, or use terminal keystrokes to work around a failed send.
+
+Claude can send `notify_when_idle` control frames to a raw reply address. The current receiver saves those frames but does not answer them; they are not work requests, and their eventual expiry says nothing about whether the requested work succeeded. Do not claim idle-notification support from socket delivery alone.
 
 If no sessions appear, check that the intended Claude session is running with messaging available. Rediscover stale targets. For wire-format failures after an update, consult [Anthropic's messaging documentation](https://code.claude.com/docs/en/cross-session-messaging) and the [independent Go transport](https://github.com/PeterSR/claude-code-socket-transport). Authentication tokens are not required by the verified macOS flow; the complete wire format remains an implementation detail.
 
-When modifying the helper, run `python3 scripts/test_claude_peer.py` from this skill's directory. The tests use isolated local sockets to exercise delayed replies, acknowledgement followed by completion, foreground cancellation, inbox reuse, explicit closure, durable unread handling, and follow-up sends with an unread backlog. They do not message live Claude sessions or prove that the app scheduler wakes a turn; verify the heartbeat separately through the automation tool.
+When modifying the helper, run `python3 scripts/test_claude_peer.py` from this skill's directory. The tests use isolated local sockets to exercise delayed replies, acknowledgement followed by completion, foreground cancellation, inbox reuse, explicit closure, durable unread handling, and follow-up sends with an unread backlog. They do not message live Claude sessions or prove that Codex resumes after a turn ends. Validate any new delivery mechanism separately with a live peer, covering active-turn delivery and resuming the same idle chat.
