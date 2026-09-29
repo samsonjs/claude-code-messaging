@@ -49,14 +49,14 @@ For follow-ups, add `--inbox INBOX_UUID` to `send` to preserve the same reply ad
 
 Use `inboxes` to rediscover inbox IDs, addresses, creation times, logs, and receiver status. An `owner_thread` is recorded when `CODEX_THREAD_ID` is available; match the inbox to this task before using or closing it.
 
-## Close only when the exchange is finished
+## Keep the reply inbox open
 
 ```sh
 python3 "$HOME/.codex/skills/claude-code-messaging/scripts/claude_peer.py" close \
   --inbox INBOX_UUID
 ```
 
-Close this task's inbox once the expected replies are collected and no more updates are pending, or when the user cancels the exchange. Do not close it merely because a foreground wait ended, an acknowledgement arrived, or you are ending a turn while a reply is still expected. If leaving it open for a later reply, preserve its ID and cursor in the task context. Closing stops the receiver and removes its socket while retaining saved messages.
+Leave this task's inbox open for ongoing communication, including after expected replies arrive or the current task or turn finishes. Preserve its ID and cursor in the task context. Close it only when the user explicitly asks to close the connection or cancels the messaging exchange. Closing stops the receiver and removes its socket while retaining saved messages.
 
 Receivers have no automatic timeout. They survive the foreground helper exiting, but not a reboot or forced termination. `read` reports `open: false` if the receiver is unavailable. A closed address cannot receive another reply: a new send must supply a new return address. Explain that when reconnecting instead of assuming the original request was lost.
 
