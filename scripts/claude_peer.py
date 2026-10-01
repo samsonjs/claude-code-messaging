@@ -3,6 +3,7 @@
 import argparse
 import datetime
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -99,13 +100,33 @@ def private_socket(path):
         raise ValueError('Target socket must have no group or other access')
 
 
-def start_inbox(socket_directory, no_dispatch=False):
+def sockets_root():
+    # Reply sockets cannot live under OUTPUT: AF_UNIX paths are capped near 104 bytes
+    # and the data directory alone often exceeds that. /tmp keeps the prefix short and
+    # predictable; the digest keeps separate CLAUDE_PEER_DATA_DIR values isolated.
+    root = Path('/tmp') / f'cc-peer-{hashlib.sha256(str(OUTPUT).encode()).hexdigest()[:8]}'
+    root.mkdir(mode=0o700, exist_ok=True)
+    info = root.stat()
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise ValueError(f'Reply socket directory must be owned by this account with mode 0700: {root}')
+    return root
+
+
+def reply_socket_path(inbox):
+    path = sockets_root() / f'{inbox}.sock'
+    if len(str(path).encode()) > 103:
+        raise ValueError(f'Reply socket path exceeds the AF_UNIX limit: {path}')
+    return path
+
+
+def start_inbox(no_dispatch=False):
     inbox = str(uuid.uuid4())
+    reply_socket_path(inbox)
     directory = inbox_directory(inbox)
     directory.mkdir(parents=True, mode=0o700)
     write_state(directory, {
         'inbox': inbox, 'status': 'starting', 'created_at': now(),
-        'socket_directory': str(socket_directory),
+        'socket_directory': str(sockets_root()),
         'owner_thread': os.environ.get('CODEX_THREAD_ID'),
     })
     with (directory / 'receiver.stderr').open('a') as errors:
@@ -288,7 +309,7 @@ def stop_dispatch(inbox):
 def serve(inbox):
     directory = inbox_directory(inbox)
     state = inbox_state(inbox)
-    path = Path(state['socket_directory']) / f'{os.getpid()}.sock'
+    path = reply_socket_path(inbox)
     stop = directory / 'stop'
     log = directory / 'messages.jsonl'
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -420,11 +441,9 @@ def send(args):
     # Reject oversized messages before starting a background receiver.
     if len(text.encode()) > 60000:
         raise ValueError('Message exceeds this bridge\'s 60 KiB text limit')
-    state = inbox_state(args.inbox) if args.inbox else start_inbox(path.parent, args.no_dispatch)
+    state = inbox_state(args.inbox) if args.inbox else start_inbox(args.no_dispatch)
     if not inbox_open(state):
         raise ValueError('Reply inbox is closed or unavailable; send using a new inbox')
-    if Path(state['socket_path']).parent.resolve() != path.parent.resolve():
-        raise ValueError('Reply inbox belongs to a different socket directory; use a new inbox')
     inbox = state['inbox']
     address = state['reply_address']
     previous = messages(inbox, 0)

@@ -430,5 +430,61 @@ class ReplyLifetimeTests(unittest.TestCase):
         self.inboxes.discard(sent['inbox'])
 
 
+    def test_reply_socket_is_named_for_the_inbox_outside_the_target_directory(self):
+        before = set(self.base.glob('*.sock'))
+        process, frame, sent = self.start_send()
+        process.communicate(timeout=5)
+        reply = Path(frame['from'].removeprefix('uds:'))
+        self.assertEqual(reply.name, f"{sent['inbox']}.sock",
+                         'The reply socket must be named for its inbox, not a reusable PID')
+        self.assertNotEqual(reply.parent.resolve(), self.socket_path.parent.resolve(),
+                            'The reply socket must not be created in the target socket directory')
+        self.assertEqual(set(self.base.glob('*.sock')) - before, set(),
+                         'Sending must not leave sockets in the target socket directory')
+
+    def test_reply_socket_fits_the_address_limit_under_a_long_data_directory(self):
+        nested = self.base / 'data' / ('deeply-nested-' + 'x' * 80)
+        self.env = {**self.env, 'CLAUDE_PEER_DATA_DIR': str(nested)}
+        self.assertGreater(len(str(nested).encode()), 103)
+        process, frame, sent = self.start_send()
+        process.communicate(timeout=5)
+        reply = frame['from'].removeprefix('uds:')
+        self.assertLessEqual(len(reply.encode()), 103, 'Reply address exceeds the AF_UNIX limit')
+        self.reply(frame['from'], 'Long data directories still receive replies.')
+        rows = self.read_messages(sent['inbox'])
+        self.assertEqual(rows[0]['frame']['message']['content'],
+                         'Long data directories still receive replies.')
+
+
+    def legacy_inbox(self):
+        """An inbox as it existed before reply sockets moved out of Claude's socket directory."""
+        inbox = str(uuid.uuid4())
+        directory = Path(self.env['CLAUDE_PEER_DATA_DIR']) / 'inboxes' / inbox
+        directory.mkdir(parents=True, exist_ok=True)
+        legacy = self.base / f'legacy-{inbox[:8]}.sock'
+        receiver = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        receiver.bind(str(legacy))
+        legacy.chmod(0o600)
+        receiver.listen(4)
+        self.addCleanup(receiver.close)
+        (directory / 'state.json').write_text(json.dumps({
+            'inbox': inbox, 'status': 'open', 'created_at': '2026-09-29T00:00:00-07:00',
+            'socket_directory': str(self.base), 'owner_thread': None,
+            'pid': os.getpid(), 'socket_path': str(legacy),
+            'reply_address': 'uds:' + str(legacy), 'log': str(directory / 'messages.jsonl'),
+        }))
+        return inbox, legacy
+
+    def test_inbox_created_before_the_socket_move_keeps_its_return_address(self):
+        inbox, legacy = self.legacy_inbox()
+        process, frame, sent = self.start_send(inbox=inbox)
+        output, errors = process.communicate(timeout=5)
+        self.assertEqual(sent['inbox'], inbox, output + errors)
+        self.assertEqual(sent['reply_address'], 'uds:' + str(legacy),
+                         'Reusing a pre-move inbox must preserve its original return address')
+        self.assertEqual(frame['from'], 'uds:' + str(legacy))
+        self.inboxes.discard(inbox)
+
+
 if __name__ == '__main__':
     unittest.main()
