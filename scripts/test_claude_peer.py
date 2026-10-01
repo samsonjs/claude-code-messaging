@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 
@@ -38,6 +39,7 @@ class ReplyLifetimeTests(unittest.TestCase):
             **os.environ, 'CLAUDE_CONFIG_DIR': str(self.config),
             'CLAUDE_PEER_DATA_DIR': str(self.base / 'data'),
         }
+        self.env.pop('CODEX_THREAD_ID', None)
         self.inboxes = set()
         self.processes = []
 
@@ -57,13 +59,15 @@ class ReplyLifetimeTests(unittest.TestCase):
             capture_output=True, text=True, timeout=10,
         )
 
-    def start_send(self, wait='0.05', inbox=None):
+    def start_send(self, wait='0.05', inbox=None, no_dispatch=False):
         args = [
             sys.executable, '-u', str(SCRIPT), 'send', '--pid', str(os.getpid()),
             '--wait', wait, '--message', 'Please reply when the build finishes.',
         ]
         if inbox:
             args += ['--inbox', inbox]
+        if no_dispatch:
+            args += ['--no-dispatch']
         process = subprocess.Popen(args, env=self.env, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True)
         self.processes.append(process)
@@ -81,12 +85,12 @@ class ReplyLifetimeTests(unittest.TestCase):
             self.inboxes.add(sent['inbox'])
         return process, frame, sent
 
-    def reply(self, address, text):
+    def reply(self, address, text, message_id=None, frame_type='user'):
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(5)
             client.connect(address.removeprefix('uds:'))
             client.sendall((json.dumps({
-                'type': 'user', 'msgV': 1, 'msg_id': str(uuid.uuid4()),
+                'type': frame_type, 'msgV': 1, 'msg_id': message_id or str(uuid.uuid4()),
                 'from': 'uds:' + str(self.socket_path),
                 'message': {'role': 'user', 'content': text},
             }) + '\n').encode())
@@ -95,6 +99,203 @@ class ReplyLifetimeTests(unittest.TestCase):
         result = self.cli('read', '--inbox', inbox, '--after', str(after), '--wait', '1')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return [json.loads(line) for line in result.stdout.splitlines()]
+
+    def enable_queue_fixture(self):
+        self.queue_log = self.base / 'queued.jsonl'
+        self.owner_thread = str(uuid.uuid4())
+        executable = self.base / 'codex'
+        executable.write_text(
+            f'#!{sys.executable}\n'
+            'import json, os, sys, time\n'
+            'from pathlib import Path\n'
+            'if sys.argv[1:] == ["queue", "--help"]:\n'
+            '    sys.exit(0)\n'
+            'with Path(os.environ["QUEUE_LOG"]).open("a") as handle:\n'
+            '    handle.write(json.dumps(sys.argv[1:]) + "\\n")\n'
+            'crash = Path(os.environ["QUEUE_LOG"]).with_suffix(".crash")\n'
+            'if crash.exists():\n'
+            '    crash.unlink()\n'
+            '    os.kill(os.getppid(), 9)\n'
+            'while Path(os.environ["QUEUE_LOG"]).with_suffix(".block").exists():\n'
+            '    time.sleep(0.05)\n'
+            'if Path(os.environ["QUEUE_LOG"]).with_suffix(".fail").exists():\n'
+            '    sys.exit("Queue is unavailable")\n'
+            'print("Queued message fixture for thread " + sys.argv[3])\n'
+        )
+        executable.chmod(0o700)
+        self.env.update(CODEX_THREAD_ID=self.owner_thread, QUEUE_LOG=str(self.queue_log),
+                        PATH=str(self.base) + os.pathsep + self.env.get('PATH', ''))
+
+    def queued(self, count=1):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if self.queue_log.exists():
+                rows = [json.loads(line) for line in self.queue_log.read_text().splitlines()]
+                if len(rows) >= count:
+                    return rows
+            time.sleep(0.02)
+        self.fail('The persistent receiver did not dispatch the saved reply')
+
+    def wait_dispatch_status(self, status):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            state = json.loads(self.cli('inboxes').stdout)
+            if state['dispatch_status'] == status:
+                return state
+            time.sleep(0.02)
+        self.fail(f'Dispatch did not reach {status}: {state}')
+
+    def test_receiver_queues_later_reply_to_owner_without_acknowledging(self):
+        self.enable_queue_fixture()
+        process, frame, sent = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0)
+        self.reply(frame['from'], 'The slow build is ready for review.')
+
+        queued = self.queued()
+        self.assertEqual(queued[0][:3], ['queue', '--thread', self.owner_thread])
+        self.assertEqual(queued[0][3], '--message')
+        self.assertIn('The slow build is ready for review.', queued[0][4])
+        self.assertIn(sent['inbox'], queued[0][4])
+        state = json.loads(self.cli('inboxes').stdout)
+        self.assertTrue(sent['receiver_wakes_agent'])
+        self.assertEqual(state['unread_count'], 1)
+        self.assertEqual(state['acknowledged_cursor'], 0)
+
+    def test_replayed_frame_is_saved_and_dispatched_once(self):
+        self.enable_queue_fixture()
+        process, frame, sent = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        message_id = str(uuid.uuid4())
+        for _ in range(2):
+            self.reply(frame['from'], 'Trent finished the review.', message_id=message_id)
+        self.reply(frame['from'], 'Fat Mike has another result.')
+        queued = self.queued(count=2)
+        rows = self.read_messages(sent['inbox'])
+        self.assertEqual(len([row for row in rows if row['event'] == 'received']), 2)
+        self.assertEqual(len(queued), 2)
+        self.assertIn('Fat Mike has another result.', queued[1][4])
+
+    def test_interrupted_queue_attempt_stays_unread_and_is_not_retried(self):
+        self.enable_queue_fixture()
+        self.queue_log.with_suffix('.crash').touch()
+        process, frame, sent = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        self.reply(frame['from'], 'Greg Graffin finished the review.')
+        self.queued()
+        state = self.wait_dispatch_status('uncertain')
+        self.assertFalse(state['receiver_wakes_agent'])
+        self.assertEqual(state['unread_count'], 1)
+        result = self.cli('dispatch', '--inbox', sent['inbox'])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(len(self.queued()), 1)
+
+        rows = self.read_messages(sent['inbox'])
+        self.assertEqual(rows[0]['frame']['message']['content'],
+                         'Greg Graffin finished the review.')
+        self.cli('ack', '--inbox', sent['inbox'], '--through', '1')
+        result = self.cli('dispatch', '--inbox', sent['inbox'])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.reply(frame['from'], 'Jane Doe finished a second review.')
+        queued = self.queued(count=2)
+        self.assertIn('Jane Doe finished a second review.', queued[1][4])
+
+    def test_blocked_queue_does_not_block_receiving_or_explicit_close(self):
+        self.enable_queue_fixture()
+        self.queue_log.with_suffix('.block').touch()
+        process, frame, sent = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        self.reply(frame['from'], 'First reply starts a slow queue command.')
+        self.queued()
+        self.reply(frame['from'], 'Second reply still reaches the saved inbox.')
+        rows = self.read_messages(sent['inbox'], after=1)
+        self.assertEqual(rows[0]['frame']['message']['content'],
+                         'Second reply still reaches the saved inbox.')
+        result = self.cli('close', '--inbox', sent['inbox'])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(json.loads(result.stdout)['receiver_wakes_agent'])
+        state = self.wait_dispatch_status('closed')
+        self.assertEqual(state['unread_count'], 2)
+        self.inboxes.discard(sent['inbox'])
+
+    def test_large_reply_queues_a_bounded_notification_and_preserves_full_text(self):
+        self.enable_queue_fixture()
+        process, frame, sent = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        content = 'Powder day review. ' * 4000
+        self.reply(frame['from'], content)
+        queued = self.queued()
+        self.assertLessEqual(len(queued[0][4].encode()), 16000)
+        rows = self.read_messages(sent['inbox'])
+        self.assertEqual(rows[0]['frame']['message']['content'], content)
+
+    def test_existing_storage_inbox_dispatches_backlog_only_to_its_owner(self):
+        self.enable_queue_fixture()
+        process, frame, sent = self.start_send(wait='0', no_dispatch=True)
+        process.communicate(timeout=5)
+        self.reply(frame['from'], 'John Doe has a saved handoff.')
+        self.read_messages(sent['inbox'])
+        self.assertFalse(sent['receiver_wakes_agent'])
+
+        self.env['CODEX_THREAD_ID'] = str(uuid.uuid4())
+        result = self.cli('dispatch', '--inbox', sent['inbox'])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertFalse(self.queue_log.exists())
+        self.env['CODEX_THREAD_ID'] = self.owner_thread
+        for _ in range(2):
+            result = self.cli('dispatch', '--inbox', sent['inbox'])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.queued()), 1)
+        self.assertEqual(json.loads(self.cli('inboxes').stdout)['unread_count'], 1)
+
+    def test_queue_failure_is_reported_without_consuming_or_resending_reply(self):
+        self.enable_queue_fixture()
+        self.queue_log.with_suffix('.fail').touch()
+        process, frame, sent = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        self.reply(frame['from'], 'The result must survive a queue failure.')
+        state = self.wait_dispatch_status('error')
+        self.assertIn('Queue is unavailable', state['dispatch_error'])
+        self.assertFalse(state['receiver_wakes_agent'])
+        self.assertEqual(state['unread_count'], 1)
+        self.assertEqual(state['acknowledged_cursor'], 0)
+        result = self.cli('dispatch', '--inbox', sent['inbox'])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(len(self.queued()), 1)
+
+    def test_control_frames_are_saved_without_starting_codex_turns(self):
+        self.enable_queue_fixture()
+        process, frame, sent = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        self.reply(frame['from'], 'Idle subscription.', frame_type='notify_when_idle')
+        self.read_messages(sent['inbox'])
+        self.assertFalse(self.queue_log.exists())
+        self.reply(frame['from'], 'A real peer reply needs attention.')
+        queued = self.queued()
+        self.assertEqual(len(queued), 1)
+        self.assertIn('A real peer reply needs attention.', queued[0][4])
+
+    def test_dispatch_restart_does_not_repeat_a_queued_unread_reply(self):
+        self.enable_queue_fixture()
+        process, frame, sent = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        self.reply(frame['from'], 'A queued handoff has not been handled yet.')
+        self.queued()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            state = json.loads(self.cli('inboxes').stdout)
+            if state['dispatch_cursor'] == 1:
+                break
+        self.assertEqual(state['dispatch_cursor'], 1)
+        os.killpg(state['dispatch_pid'], signal.SIGTERM)
+        self.wait_dispatch_status('stopped')
+        result = self.cli('dispatch', '--inbox', sent['inbox'])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.reply(frame['from'], 'A fresh handoff follows the restart.')
+        queued = self.queued(count=2)
+        self.assertEqual(len(queued), 2)
+        self.assertIn('A fresh handoff follows the restart.', queued[1][4])
+        self.assertEqual(json.loads(self.cli('inboxes').stdout)['unread_count'], 2)
 
     def test_reply_arrives_after_send_command_times_out_and_exits(self):
         process, frame, sent = self.start_send()
