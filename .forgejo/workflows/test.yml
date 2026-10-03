@@ -32,3 +32,15 @@ jobs:
 
       - name: Test reply inboxes
         run: python3 scripts/test_claude_peer.py
+
+  workflows:
+    name: Lint workflows
+    runs-on: docker
+    container:
+      image: docker.io/library/ruby:4.0.5
+    timeout-minutes: 5
+    steps:
+      - name: Check out
+        uses: https://git.samhuri.net/sjs/actions/checkout@v1
+      - name: actionlint
+        uses: https://git.samhuri.net/sjs/actions/actionlint@v1
