@@ -24,6 +24,8 @@ Ask Codex:
 
 The full workflow is in [SKILL.md](SKILL.md).
 
+Claude's `ListAgents` and the CLI's `/peers` command list Claude sessions. This bridge does not register Codex chats there: Codex starts an exchange, and Claude replies with native `SendMessage` by copying the incoming message's `from` address into `to`. “Codex” is only the sender's display name. Claude's current tool instructions describe this reply workflow, and Claude can use its existing messaging tools without installing this skill.
+
 ## Reply lifetime
 
 `send --wait 30` waits in the foreground for up to 30 seconds. Its detached reply receiver stays open after that wait expires, after the first reply, and after the foreground command is interrupted. `--wait 0` returns immediately while retaining a return address.
@@ -58,7 +60,7 @@ Push changes to `origin` on Forgejo. Forgejo mirrors updates to GitHub automatic
 
 ## Protocol references
 
-The wire format was verified with Claude Code 2.1.280 on macOS. It is an implementation detail that may change with Claude updates.
+A round trip using the helper and Claude's native `SendMessage` was verified with Claude Code 2.1.299 on macOS on 2026-10-15. Claude received both messages and replied to the persistent inbox, while confirming Codex was absent from `ListAgents`. The wire format remains an implementation detail that may change with Claude updates.
 
 - [Anthropic's cross-session messaging documentation](https://code.claude.com/docs/en/cross-session-messaging)
 - [Independent Go implementation of the socket transport](https://github.com/PeterSR/claude-code-socket-transport)

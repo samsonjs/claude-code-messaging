@@ -5,7 +5,13 @@ description: Discover and exchange messages with existing local Claude Code sess
 
 # Claude Code Messaging
 
-Use the bundled Python helper to communicate with existing Claude Code sessions on the same Mac or Linux machine. It requires Python 3.10+ and no third-party packages. The native message format was verified with Claude Code 2.1.280 on macOS.
+Use the bundled Python helper to communicate with existing Claude Code sessions on the same Mac or Linux machine. It requires Python 3.10+ and no third-party packages. The native message format and a round trip using Claude's `SendMessage` were verified with Claude Code 2.1.299 on macOS on 2026-10-15.
+
+## Claude discovery and Codex return addresses
+
+Claude's `ListAgents` lists Claude sessions; the Claude Code CLI also exposes `/list-agents` (`/peers`). This bridge creates a reply inbox for one Codex chat; it does not register that chat as a Claude session. A missing “Codex” row is expected. Codex starts the exchange with `send`, then Claude replies by copying the exact `from` address from the incoming `<cross-session-message>` into `SendMessage`'s `to` field. The display name “Codex” is not a reply address. Reuse the inbox for follow-ups so Claude retains a stable address.
+
+In Claude Code 2.1.299, the tool instructions say the session name is the address and no longer advertise raw `uds:` targets. They do describe replying by copying an incoming message's `from` attribute. Explicitly ask Claude to reply to that return address; do not ask it to find Codex in `ListAgents`. A native `SendMessage(to="uds:…", message="…")` reply was verified even though Codex never appeared in the listing. Claude needs only its native messaging tools to reply; installing this skill on the Claude side is unnecessary.
 
 ## Keep the exchange moving
 
@@ -31,7 +37,7 @@ Run the helper inside this skill's directory. The default installation is:
 python3 "$HOME/.codex/skills/claude-code-messaging/scripts/claude_peer.py" list
 ```
 
-JSONL output includes each session's PID, name, working directory, session ID, and socket path. Match the requested session using these fields and the conversation context. Ask which target the user means only when candidates remain ambiguous. Discover afresh instead of reusing old PIDs; registry status is a snapshot. If this skill was relocated, use the helper inside the loaded skill directory.
+JSONL output includes each session's PID, name, working directory, session ID, and socket path. This lists local Claude sessions only; it does not enumerate Codex chats or Claude's remote sessions. Match the requested session using these fields and the conversation context. Ask which target the user means only when candidates remain ambiguous. Discover afresh instead of reusing old PIDs; registry status is a snapshot. If this skill was relocated, use the helper inside the loaded skill directory.
 
 ## Send with a persistent reply inbox
 
@@ -116,10 +122,10 @@ Exit codes: `0` success, including an empty read; `1` error; `2` negative delive
 
 ## Limits and troubleshooting
 
-This skill does not start Claude sessions or register Codex in Claude's agent list. Replies should use the supplied raw `uds:` address; the display name “Codex” is not a discoverable Claude session name. It reads `${CLAUDE_CONFIG_DIR:-~/.claude}/sessions/*.json`, checks socket ownership and permissions, and addresses the target session ID to guard against a reused socket. Do not change Claude's permissions, read authentication keys, fabricate session registrations, or use terminal keystrokes to work around a failed send.
+This skill does not start Claude sessions or expose Codex chats through Claude's registry. It reads `${CLAUDE_CONFIG_DIR:-~/.claude}/sessions/*.json`, checks socket ownership and permissions, and addresses the target session ID to guard against a reused socket. Do not change Claude's permissions, read authentication keys, fabricate session registrations, or use terminal keystrokes to work around a failed send.
 
-Claude replies to reply addresses outside its own socket directory; sessions advertise this as the `reply_across_default_dirs` peer feature, and it was verified against Claude Code 2.1.284. Claude can send `notify_when_idle` control frames to a raw reply address. The current receiver saves those frames but does not answer them; they are not work requests, and their eventual expiry says nothing about whether the requested work succeeded. Do not claim idle-notification support from socket delivery alone.
+Claude replies to reply addresses outside its own socket directory; sessions advertise this as the `reply_across_default_dirs` peer feature, and it was verified against Claude Code 2.1.284 and 2.1.299. Claude can send `notify_when_idle` control frames to a raw reply address. The current receiver saves those frames but does not answer them; they are not work requests, and their eventual expiry says nothing about whether the requested work succeeded. Do not claim idle-notification support from socket delivery alone.
 
-If no sessions appear, check that the intended Claude session is running with messaging available. Rediscover stale targets. For wire-format failures after an update, consult [Anthropic's messaging documentation](https://code.claude.com/docs/en/cross-session-messaging) and the [independent Go transport](https://github.com/PeterSR/claude-code-socket-transport). Authentication tokens are not required by the verified macOS flow; the complete wire format remains an implementation detail.
+If no sessions appear, check that the intended Claude session is running with messaging available. In the Claude Code CLI, `/list-agents` (also `/peers`) checks native discovery and `/status` shows its peer address, as described in the messaging documentation below. These terminal slash commands are not available in the Claude Desktop session used for verification. A listed session can still hold or refuse messages through its inbound controls; its registry status does not prove acceptance. Rediscover stale targets. For wire-format failures after an update, consult [Anthropic's messaging documentation](https://code.claude.com/docs/en/cross-session-messaging) and the [independent Go transport](https://github.com/PeterSR/claude-code-socket-transport). Authentication tokens are not required by the verified macOS flow; the complete wire format remains an implementation detail.
 
 When modifying the helper, run `python3 scripts/test_claude_peer.py` from this skill's directory. The tests use isolated local sockets and a fixture CLI to exercise reply lifetimes, unread handling, dispatch to the owner, replay deduplication, dispatch restarts, uncertain queue outcomes, failed and blocked queue commands, bounded notifications, and existing-inbox migration. They never message live Claude or Codex sessions. Validate host consumption separately with a live peer, covering a reply during an active turn and a real reply arriving after Codex's final response, with no intervening human input.
