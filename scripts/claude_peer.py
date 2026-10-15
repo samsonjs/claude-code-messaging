@@ -189,7 +189,7 @@ def register_chat(name=None, cwd=None, no_dispatch=False, sender_mode=None, owne
             inbox = (candidates[0]['inbox'] if candidates else
                      str(uuid.uuid5(uuid.NAMESPACE_URL, f'{OUTPUT}:{owner}')))
             record = {'owner_thread': owner, 'inbox': inbox,
-                      'name': name or f'Codex {owner[:8]}',
+                      'name': name or f'Codex {owner[-8:]}',
                       'cwd': str(Path(cwd or Path.cwd()).resolve())}
         if name is not None:
             if not name.strip() or len(name) > 200:
@@ -199,6 +199,7 @@ def register_chat(name=None, cwd=None, no_dispatch=False, sender_mode=None, owne
             record['cwd'] = str(Path(cwd).resolve())
         if sender_mode is not None:
             record['sender_mode'] = sender_mode
+        record['participating'] = True
         write_json(path, record)
         set_activity(owner, 'busy')
         state = start_inbox(True, inbox=record['inbox'], owner=owner)
@@ -211,16 +212,22 @@ def register_chat(name=None, cwd=None, no_dispatch=False, sender_mode=None, owne
 def discover_chats(include_closed=False):
     for path in sorted((OUTPUT / 'chats').glob('*.json')):
         record = json.loads(path.read_text())
+        if not record.get('participating', False):
+            continue
         state = inbox_state(record['inbox'])
         opened = inbox_open(state)
         if opened or include_closed:
             activity = activity_state(record['owner_thread'])
-            yield {key: value for key, value in {
+            row = {
                 'name': record['name'], 'cwd': record['cwd'],
                 'reply_address': state.get('reply_address'), 'open': opened,
                 'receiver_wakes_agent': dispatch_details(state['inbox'])['receiver_wakes_agent'],
                 'activity': activity.get('state', 'unknown'),
-            }.items()}
+            }
+            if include_closed:
+                row.update(chat_id=record['owner_thread'][-12:],
+                           sender_mode=record.get('sender_mode', 'unknown'))
+            yield row
 
 
 def activity_state(owner):
@@ -342,15 +349,20 @@ def lifecycle(payload):
         if bound and bound != owner:
             raise ValueError('SessionStart identity does not match the calling chat')
         existing = chat_record(owner)
+        if not existing or not existing.get('participating', False):
+            return
+        if inbox_state(existing['inbox']).get('status') == 'closed':
+            return
         cwd = payload.get('cwd')
-        label = f'Codex {Path(cwd).name} {owner[:8]}' if cwd else None
-        register_chat(name=None if existing else label, cwd=cwd, owner=owner)
-    if not chat_record(owner):
+        register_chat(cwd=cwd, owner=owner)
+    record = chat_record(owner)
+    if not record or not record.get('participating', False):
         return
     turn_id = payload.get('turn_id') or payload.get('turn-id')
     permission = payload.get('permission_mode')
     mode = {'bypassPermissions': 'bypass', 'default': 'prompting',
-            'acceptEdits': 'prompting', 'dontAsk': 'bypass', 'plan': 'unknown'}.get(
+            'acceptEdits': 'prompting', 'dontAsk': 'prompting', 'auto': 'prompting',
+            'plan': 'unknown'}.get(
                 permission, 'unknown' if 'permission_mode' in payload else None)
     if mode:
         path = chat_path(owner)

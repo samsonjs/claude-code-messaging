@@ -44,6 +44,8 @@ class ReplyLifetimeTests(unittest.TestCase):
         self.processes = []
 
     def tearDown(self):
+        self.inboxes.update(path.parent.name for path in
+                            (self.base / 'data' / 'inboxes').glob('*/state.json'))
         for inbox in self.inboxes:
             self.cli('close', '--inbox', inbox)
         for process in self.processes:
@@ -349,16 +351,19 @@ class ReplyLifetimeTests(unittest.TestCase):
             self.assertIn(result, (0, -signal.SIGPIPE))
             self.assertEqual(process.stderr.read(), '')
 
-    def test_no_approval_hook_mode_is_not_reported_as_prompting(self):
+    def test_hook_modes_follow_native_messaging_permission_classes(self):
         self.enable_queue_fixture()
         registered = json.loads(self.cli('register', '--sender-mode', 'prompting').stdout)
         self.inboxes.add(registered['inbox'])
-        event = {'hook_event_name': 'UserPromptSubmit', 'session_id': self.owner_thread,
-                 'turn_id': 'powder-turn', 'permission_mode': 'dontAsk'}
-        self.assertEqual(self.cli('hook', input=json.dumps(event)).returncode, 0)
-        process, frame, _ = self.start_send(wait='0')
-        process.communicate(timeout=5)
-        self.assertEqual(frame['from_mode'], 'bypass')
+        for permission, expected in [('bypassPermissions', 'bypass'), ('default', 'prompting'),
+                                     ('dontAsk', 'prompting'), ('auto', 'prompting')]:
+            with self.subTest(permission=permission):
+                event = {'hook_event_name': 'UserPromptSubmit', 'session_id': self.owner_thread,
+                         'turn_id': 'powder-turn', 'permission_mode': permission}
+                self.assertEqual(self.cli('hook', input=json.dumps(event)).returncode, 0)
+                process, frame, _ = self.start_send(wait='0')
+                process.communicate(timeout=5)
+                self.assertEqual(frame.get('from_mode'), expected)
 
     def test_unrecognised_hook_mode_clears_a_previously_declared_mode(self):
         self.enable_queue_fixture()
@@ -386,8 +391,21 @@ class ReplyLifetimeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(json.loads(output.read_text()), json.loads(payload))
 
-    def test_session_start_hook_registers_a_chat_without_an_outgoing_message(self):
+    def test_session_start_does_not_enrol_an_unregistered_chat(self):
         self.enable_queue_fixture()
+        event = {'hook_event_name': 'SessionStart', 'session_id': self.owner_thread,
+                 'cwd': str(self.base), 'permission_mode': 'bypassPermissions'}
+        self.env.pop('CODEX_THREAD_ID')
+        result = self.cli('hook', input=json.dumps(event))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.cli('chats').stdout.strip(), '')
+        self.assertEqual(self.cli('inboxes').stdout.strip(), '')
+
+    def test_session_start_reconnects_only_an_already_registered_chat(self):
+        self.enable_queue_fixture()
+        registered = json.loads(self.cli('register', '--name', 'Powder planning').stdout)
+        self.inboxes.add(registered['inbox'])
+        os.kill(json.loads(self.cli('inboxes').stdout)['pid'], signal.SIGKILL)
         event = {'hook_event_name': 'SessionStart', 'session_id': self.owner_thread,
                  'cwd': str(self.base), 'permission_mode': 'bypassPermissions'}
         self.env.pop('CODEX_THREAD_ID')
@@ -400,10 +418,37 @@ class ReplyLifetimeTests(unittest.TestCase):
         self.inboxes.add(state['inbox'])
         self.assertTrue(chats[0]['receiver_wakes_agent'])
         self.assertEqual(chats[0]['cwd'], str(self.base))
+        self.assertEqual(chats[0]['reply_address'], registered['reply_address'])
         process, frame, sent = self.start_send(wait='0')
         process.communicate(timeout=5)
         self.assertEqual(frame['from_mode'], 'bypass')
         self.assertEqual(sent['reply_address'], chats[0]['reply_address'])
+
+    def test_session_start_does_not_reopen_an_explicitly_closed_connection(self):
+        self.enable_queue_fixture()
+        registered = json.loads(self.cli('register').stdout)
+        self.inboxes.add(registered['inbox'])
+        self.assertEqual(self.cli('close', '--inbox', registered['inbox']).returncode, 0)
+        event = {'hook_event_name': 'SessionStart', 'session_id': self.owner_thread,
+                 'cwd': str(self.base), 'permission_mode': 'default'}
+        self.assertEqual(self.cli('hook', input=json.dumps(event)).returncode, 0)
+        self.assertFalse(json.loads(self.cli('inboxes').stdout)['open'])
+
+    def test_legacy_automatic_registration_is_hidden_until_explicitly_registered(self):
+        self.enable_queue_fixture()
+        registered = json.loads(self.cli('register', '--sender-mode', 'prompting').stdout)
+        self.inboxes.add(registered['inbox'])
+        path = self.base / 'data' / 'chats' / f'{self.owner_thread}.json'
+        legacy = json.loads(path.read_text())
+        legacy.pop('participating')
+        path.write_text(json.dumps(legacy))
+        self.assertEqual(self.cli('chats', '--all').stdout.strip(), '')
+        restored = json.loads(self.cli('register', '--name', 'Powder planning').stdout)
+        self.assertEqual(restored['reply_address'], registered['reply_address'])
+        rows = [json.loads(line) for line in self.cli('chats', '--all').stdout.splitlines()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['sender_mode'], 'prompting')
+        self.assertEqual(rows[0]['chat_id'], self.owner_thread[-12:])
 
     def test_tracked_idle_answers_immediately_without_waking_the_codex_chat(self):
         self.enable_queue_fixture()
