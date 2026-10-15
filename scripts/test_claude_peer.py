@@ -315,6 +315,63 @@ class ReplyLifetimeTests(unittest.TestCase):
         self.reply(registered['reply_address'], 'Recovery succeeded.')
         self.assertEqual(self.read_messages(registered['inbox'])[0]['seq'], 1)
 
+    def test_registration_and_ack_keep_the_active_turn_completion_guard(self):
+        self.enable_queue_fixture()
+        registered = json.loads(self.cli('register').stdout)
+        self.inboxes.add(registered['inbox'])
+        for operation in ('register', 'ack'):
+            with self.subTest(operation=operation):
+                turn = 'powder-' + operation
+                event = {'hook_event_name': 'UserPromptSubmit', 'session_id': self.owner_thread,
+                         'turn_id': turn}
+                self.assertEqual(self.cli('hook', input=json.dumps(event)).returncode, 0)
+                args = (['register'] if operation == 'register' else
+                        ['ack', '--inbox', registered['inbox'], '--through', '0'])
+                self.assertEqual(self.cli(*args).returncode, 0)
+                complete = {'type': 'agent-turn-complete', 'thread-id': self.owner_thread,
+                            'turn-id': 'late-earlier-' + operation}
+                self.assertEqual(self.cli('notify', json.dumps(complete)).returncode, 0)
+                self.assertEqual(json.loads(self.cli('chats').stdout)['activity'], 'busy')
+                complete['turn-id'] = turn
+                self.assertEqual(self.cli('notify', json.dumps(complete)).returncode, 0)
+                self.assertEqual(json.loads(self.cli('chats').stdout)['activity'], 'idle')
+
+    def test_listing_stops_quietly_when_a_pipeline_reader_closes(self):
+        registry = self.config / 'sessions'
+        sample = (registry / f'{os.getpid()}.json').read_text()
+        for index in range(200):
+            (registry / f'listing-{index}.json').write_text(sample)
+        with subprocess.Popen([sys.executable, str(SCRIPT), 'list'], env=self.env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            self.assertTrue(process.stdout.readline())
+            process.stdout.close()
+            result = process.wait(timeout=5)
+            self.assertIn(result, (0, -signal.SIGPIPE))
+            self.assertEqual(process.stderr.read(), '')
+
+    def test_no_approval_hook_mode_is_not_reported_as_prompting(self):
+        self.enable_queue_fixture()
+        registered = json.loads(self.cli('register', '--sender-mode', 'prompting').stdout)
+        self.inboxes.add(registered['inbox'])
+        event = {'hook_event_name': 'UserPromptSubmit', 'session_id': self.owner_thread,
+                 'turn_id': 'powder-turn', 'permission_mode': 'dontAsk'}
+        self.assertEqual(self.cli('hook', input=json.dumps(event)).returncode, 0)
+        process, frame, _ = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        self.assertEqual(frame['from_mode'], 'bypass')
+
+    def test_unrecognised_hook_mode_clears_a_previously_declared_mode(self):
+        self.enable_queue_fixture()
+        registered = json.loads(self.cli('register', '--sender-mode', 'prompting').stdout)
+        self.inboxes.add(registered['inbox'])
+        event = {'hook_event_name': 'UserPromptSubmit', 'session_id': self.owner_thread,
+                 'turn_id': 'powder-turn', 'permission_mode': 'future-permission-policy'}
+        self.assertEqual(self.cli('hook', input=json.dumps(event)).returncode, 0)
+        process, frame, _ = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        self.assertNotIn('from_mode', frame)
+        self.assertNotIn('from-mode=', frame['message']['content'])
+
     def test_notify_also_runs_the_previously_configured_notifier(self):
         output = self.base / 'forwarded.json'
         executable = self.base / 'previous-notifier'

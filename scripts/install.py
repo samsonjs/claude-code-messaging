@@ -15,6 +15,16 @@ import claude_peer as peer
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def is_bridge_hook(handler):
+    if handler.get('type') != 'command':
+        return False
+    try:
+        parts = shlex.split(handler.get('command', ''))
+    except ValueError:
+        return False
+    return len(parts) == 3 and parts[1:] == [str(ROOT / 'scripts' / 'claude_peer.py'), 'hook']
+
+
 def replace_notify(source, value):
     lines = source.splitlines(keepends=True)
     replacement = 'notify = ' + json.dumps(value) + '\n'
@@ -57,10 +67,11 @@ def install(codex_home, claude_home):
     for event in ('SessionStart', 'UserPromptSubmit', 'Interrupt', 'SessionEnd'):
         groups = hooks.setdefault(event, [])
         installed = [handler for group in groups for handler in group.get('hooks', [])
-                     if handler.get('command') == hook_command]
+                     if is_bridge_hook(handler)]
         timeout = 10 if event == 'SessionStart' else 3
         if installed:
             for handler in installed:
+                handler['command'] = hook_command
                 handler['timeout'] = timeout
         else:
             groups.append({'hooks': [{'type': 'command', 'command': hook_command, 'timeout': timeout}]})

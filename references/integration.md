@@ -12,6 +12,8 @@ The installer adds `claude_code_messaging` through `codex mcp add`, installs the
 
 Reload MCP configuration in the client if the tools do not appear. Codex requires new or changed hooks to be reviewed and trusted through its normal hook UI (`/hooks` in the CLI). The installer does not change trust records. Once reviewed, the SessionStart hook registers new/resumed chats automatically, and the other hooks track turn starts, interruptions, session end, and permission mode. Real completion comes from `notify`'s `agent-turn-complete` event, rather than a guessed timer or a model-authored status message. See [Codex hooks](https://learn.chatgpt.com/docs/hooks) and [notifications](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications).
 
+Verify both paths with real host events: a prompt should update `lifecycle/<thread-id>.json` in the bridge's data directory, and a completed turn should add its ID to `completed_turns`. A chat opened before installation can retain an earlier notifier configuration; if prompt hooks run but completions remain absent, reload or resume the affected chat and check again. Running the notifier manually verifies the handler, not host activation. Reinstalling after a Python upgrade updates the existing bridge hook commands instead of adding another copy; changed commands need normal hook review.
+
 ## Stable chat addresses
 
 Run from a participating Codex chat:
@@ -48,7 +50,7 @@ Pass the current chat's `CODEX_THREAD_ID` as `thread_id`, never an ID copied fro
 
 ## Sender permission mode
 
-`from_mode` is `prompting`, `bypass`, or omitted when unknown. Trusted lifecycle events update it from the host's permission mode; ambiguous plan mode remains unknown. Registration also accepts `--sender-mode` when the actual runtime policy is known. Do not infer a chat's current policy from global defaults or select a mode to avoid an inbound hold.
+`from_mode` is `prompting`, `bypass`, or omitted when unknown. Trusted lifecycle events update it from the host's permission mode: `bypassPermissions` and `dontAsk` report `bypass`, while `default` and `acceptEdits` report `prompting`. Plan mode or an unrecognised mode clears an earlier declaration to unknown; completion events without a permission field preserve the known mode. Registration also accepts `--sender-mode` when the actual runtime policy is known. Do not infer a chat's current policy from global defaults or select a mode to avoid an inbound hold.
 
 A known bypass sender is held by a prompting Claude session under native defaults. Claude Desktop cannot display the terminal approval dialog, so a default-held message can expire. Receipts may not return to this bridge's socket namespace. `sent` remains proof of socket transmission, not proof of admission. Preserve the receiving session's controls; do not change permissions or downgrade the asserted mode to make delivery pass.
 

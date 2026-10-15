@@ -27,7 +27,12 @@ def now():
 
 
 def emit(event):
-    print(json.dumps(event, ensure_ascii=False), flush=True)
+    try:
+        print(json.dumps(event, ensure_ascii=False), flush=True)
+    except BrokenPipeError:
+        with open(os.devnull, 'w') as sink:
+            os.dup2(sink.fileno(), sys.stdout.fileno())
+        raise SystemExit(0)
 
 
 def append(path, event):
@@ -230,6 +235,8 @@ def set_activity(owner, state, turn_id=None, detail=None, tracked=False):
     with path.with_suffix('.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         previous = activity_state(owner)
+        if state == 'busy' and turn_id is None and previous.get('state') == 'busy':
+            turn_id = previous.get('turn_id')
         completed = previous.get('completed_turns', [])
         if state == 'idle' and turn_id and turn_id in completed:
             return previous
@@ -343,7 +350,8 @@ def lifecycle(payload):
     turn_id = payload.get('turn_id') or payload.get('turn-id')
     permission = payload.get('permission_mode')
     mode = {'bypassPermissions': 'bypass', 'default': 'prompting',
-            'acceptEdits': 'prompting', 'dontAsk': 'prompting', 'plan': 'unknown'}.get(permission)
+            'acceptEdits': 'prompting', 'dontAsk': 'bypass', 'plan': 'unknown'}.get(
+                permission, 'unknown' if 'permission_mode' in payload else None)
     if mode:
         path = chat_path(owner)
         with path.with_suffix('.lock').open('a') as lock:

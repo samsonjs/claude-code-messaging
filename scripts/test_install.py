@@ -38,6 +38,15 @@ class InstallTests(unittest.TestCase):
                     previous[0] = '/opt/previous-python'
                     (codex / 'config.toml').write_text(source.replace(
                         command_line, 'notify = ' + json.dumps(previous), 1))
+                    hooks_path = codex / 'hooks.json'
+                    installed_hooks = json.loads(hooks_path.read_text())
+                    for event, groups in installed_hooks['hooks'].items():
+                        if event != 'Stop':
+                            for group in groups:
+                                for handler in group['hooks']:
+                                    parts = handler['command'].split(' ', 1)
+                                    handler['command'] = '/opt/previous-python ' + parts[1]
+                    hooks_path.write_text(json.dumps(installed_hooks))
             config = tomllib.loads((codex / 'config.toml').read_text())
             self.assertEqual(config['model'], 'existing-model')
             self.assertIn('notify', config['notify'])
