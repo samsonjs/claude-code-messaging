@@ -22,7 +22,7 @@ Ask Codex:
 
 > Use $claude-code-messaging to ask the Claude session working on the build for a status update.
 
-The full workflow is in [SKILL.md](SKILL.md). For stable per-chat addresses, Claude-side discovery, MCP tools, lifecycle hooks, and native idle subscriptions, see [local integration](references/integration.md). Run `python3 scripts/install.py` to configure the integration; it preserves your existing completion notifier and requires normal hook review.
+The full workflow is in [SKILL.md](SKILL.md). For stable per-chat addresses, Claude-side discovery, MCP tools, lifecycle hooks, and idle-notification limits, see [local integration](references/integration.md). Run `python3 scripts/install.py` to configure the integration; it preserves your existing completion notifier and requires normal hook review.
 
 Claude's `ListAgents` and the CLI's `/peers` command list Claude sessions. This bridge does not register Codex chats there: Codex can start an exchange, and Claude replies with native `SendMessage` by copying the incoming message's `from` address into `to`. “Codex” is only the sender's display name. Claude's current tool instructions describe this reply workflow, and Claude can use its existing messaging tools without installing the Codex skill. The installed Claude-side `codex-chat-messaging` skill lets Claude discover and initiate messages to participating Codex chats.
 
@@ -40,7 +40,7 @@ Queueing and handling have separate durable journals. A queued reply stays unrea
 
 Keep the inbox open for later replies. Close it with `close --inbox UUID` when the person explicitly ends the exchange; this stops both receiver and dispatcher. They remain running until explicitly closed, forcibly terminated, or the machine restarts. Saved messages and acknowledgement positions survive closure. State and logs are kept under `~/.claude-scratchpad/claude-peer-bridge/`, outside the checkout. Set `CLAUDE_PEER_DATA_DIR` to isolate them elsewhere.
 
-Claude replies to the raw `uds:` return address; “Codex” is a display name, not a registered Claude session. Native idle subscriptions can reach that address and are answered from real Codex completion events when the integration is active. Reverse subscriptions from Codex to Claude remain unsupported by the separate socket namespace; see the integration reference for host-verification limits.
+Claude replies to the raw `uds:` return address; “Codex” is a display name, not a registered Claude session. Native idle subscriptions are unavailable in both directions: a live test with Claude Code 2.1.299 on 2026-10-15 found its namespace checks refuse subscriptions to the bridge's addresses. The bridge's control handler passes isolated wire tests, but native Claude does not send the subscription. Ordinary messages, discovery, and waking a Codex chat with a reply still work.
 
 Dispatch uses the supported `codex queue` CLI, without a scheduled automation, another chat, or a private desktop socket. Verify automatic consumption on each host with a live peer reply arriving after a final response, without another human message. A running dispatcher alone does not prove host consumption.
 

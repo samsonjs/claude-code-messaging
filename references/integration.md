@@ -54,11 +54,11 @@ A known bypass sender is held by a prompting Claude session under native default
 
 ## Idle notifications
 
-The receiver accepts native `control` / `notify_when_idle` subscriptions from live registered Claude sessions. It sends one correlated `peer_idle_notice` after a real completion, or immediately for an already-idle chat with established lifecycle tracking. Without tracked turn starts, a subscription arriving after an old completion waits for the next completion. An older turn's completion cannot mark a newer tracked turn idle. Unhandled peer work also defers notices.
+Native idle subscriptions are unavailable in both directions with Claude Code 2.1.299. In a live test on 2026-10-15, Claude's `SendMessage` delivered an ordinary message to a discovered Codex chat but refused `notify_when_idle` before sending a subscription because the target was outside Claude's socket namespace. Codex subscribing to Claude is also rejected by its control-frame address checks. Do not move sockets into Claude's directory to evade these restrictions. Reply-triggered Codex wakeups are separate and remain supported.
 
-Subscriptions expire after 12 hours. The target session ID is saved to guard against PID reuse. Attempt state is durable: uncertain deliveries are not blindly retried. Native inbound controls still apply to the resulting notice. Wire tests establish the implementation; a host-specific live subscription test must confirm actual consumption before promising end-to-end idle support.
+The receiver implements `control` / `notify_when_idle` handling for compatibility, validated only with isolated wire tests. If a valid subscription reaches it from a live registered Claude session, it sends one correlated `peer_idle_notice` after a real completion, or immediately for an already-idle chat with established lifecycle tracking. Without tracked turn starts, a subscription arriving after an old completion waits for the next completion. An older turn's completion cannot mark a newer tracked turn idle. Unhandled peer work also defers notices.
 
-Codex subscribing to Claude's idle notifications is not supported: Claude's current control-frame address checks reject the bridge's separate socket namespace. Do not move sockets into Claude's directory to evade this restriction.
+Subscriptions expire after 12 hours. The target session ID is saved to guard against PID reuse. Attempt state is durable: uncertain deliveries are not blindly retried. Native inbound controls still apply to the resulting notice. These implementation checks do not establish native interoperability; a future Claude version needs a successful live subscription and consumed notice before this can be advertised as supported.
 
 ## Background workers
 
