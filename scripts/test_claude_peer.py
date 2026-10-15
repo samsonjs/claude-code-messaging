@@ -155,8 +155,7 @@ class ReplyLifetimeTests(unittest.TestCase):
         queued = self.queued()
         self.assertEqual(queued[0][:3], ['queue', '--thread', self.owner_thread])
         self.assertEqual(queued[0][3], '--message')
-        self.assertIn('The slow build is ready for review.', queued[0][4])
-        self.assertIn(sent['inbox'], queued[0][4])
+        self.assertIn(f"{sent['inbox']}:1", queued[0][4])
         state = json.loads(self.cli('inboxes').stdout)
         self.assertTrue(sent['receiver_wakes_agent'])
         self.assertEqual(state['unread_count'], 1)
@@ -174,7 +173,7 @@ class ReplyLifetimeTests(unittest.TestCase):
         rows = self.read_messages(sent['inbox'])
         self.assertEqual(len([row for row in rows if row['event'] == 'received']), 2)
         self.assertEqual(len(queued), 2)
-        self.assertIn('Fat Mike has another result.', queued[1][4])
+        self.assertIn(f"{sent['inbox']}:2", queued[1][4])
 
     def test_interrupted_queue_attempt_stays_unread_and_is_not_retried(self):
         self.enable_queue_fixture()
@@ -198,7 +197,7 @@ class ReplyLifetimeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.reply(frame['from'], 'Jane Doe finished a second review.')
         queued = self.queued(count=2)
-        self.assertIn('Jane Doe finished a second review.', queued[1][4])
+        self.assertIn(f"{sent['inbox']}:2", queued[1][4])
 
     def test_blocked_queue_does_not_block_receiving_or_explicit_close(self):
         self.enable_queue_fixture()
@@ -218,14 +217,18 @@ class ReplyLifetimeTests(unittest.TestCase):
         self.assertEqual(state['unread_count'], 2)
         self.inboxes.discard(sent['inbox'])
 
-    def test_large_reply_queues_a_bounded_notification_and_preserves_full_text(self):
+    def test_notification_only_points_to_inbox_and_preserves_full_reply(self):
         self.enable_queue_fixture()
         process, frame, sent = self.start_send(wait='0')
         process.communicate(timeout=5)
         content = 'Powder day review. ' * 4000
         self.reply(frame['from'], content)
         queued = self.queued()
-        self.assertLessEqual(len(queued[0][4].encode()), 16000)
+        notification = queued[0][4]
+        self.assertLessEqual(len(notification.encode()), 600)
+        self.assertIn(f"{sent['inbox']}:1", notification)
+        self.assertNotIn('Powder day review.', notification)
+        self.assertNotIn('"frame"', notification)
         rows = self.read_messages(sent['inbox'])
         self.assertEqual(rows[0]['frame']['message']['content'], content)
 
@@ -273,7 +276,7 @@ class ReplyLifetimeTests(unittest.TestCase):
         self.reply(frame['from'], 'A real peer reply needs attention.')
         queued = self.queued()
         self.assertEqual(len(queued), 1)
-        self.assertIn('A real peer reply needs attention.', queued[0][4])
+        self.assertIn(f"{sent['inbox']}:2", queued[0][4])
 
     def test_dispatch_restart_does_not_repeat_a_queued_unread_reply(self):
         self.enable_queue_fixture()
@@ -294,8 +297,39 @@ class ReplyLifetimeTests(unittest.TestCase):
         self.reply(frame['from'], 'A fresh handoff follows the restart.')
         queued = self.queued(count=2)
         self.assertEqual(len(queued), 2)
-        self.assertIn('A fresh handoff follows the restart.', queued[1][4])
+        self.assertIn(f"{sent['inbox']}:2", queued[1][4])
         self.assertEqual(json.loads(self.cli('inboxes').stdout)['unread_count'], 2)
+
+    def test_explicit_dispatch_restart_preserves_address_and_handling_cursor(self):
+        self.enable_queue_fixture()
+        process, frame, sent = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        self.reply(frame['from'], 'Trent finished the first review.')
+        self.queued()
+        self.cli('ack', '--inbox', sent['inbox'], '--through', '1')
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            before = json.loads(self.cli('inboxes').stdout)
+            if before['dispatch_cursor'] == 1:
+                break
+            time.sleep(0.02)
+        self.assertEqual(before['dispatch_cursor'], 1)
+
+        result = self.cli('dispatch', '--inbox', sent['inbox'], '--restart')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        after = json.loads(self.cli('inboxes').stdout)
+        self.assertNotEqual(after['dispatch_pid'], before['dispatch_pid'])
+        self.assertEqual(after['reply_address'], sent['reply_address'])
+        self.assertEqual(after['acknowledged_cursor'], 1)
+        self.assertEqual(after['dispatch_cursor'], 1)
+        self.assertTrue(after['open'])
+        self.reply(frame['from'], 'Fat Mike finished the next review.')
+        queued = self.queued(count=2)
+        self.assertEqual(len(queued), 2)
+        self.assertIn(f"{sent['inbox']}:2", queued[1][4])
+        rows = self.read_messages(sent['inbox'], after=1)
+        self.assertEqual(rows[0]['frame']['message']['content'],
+                         'Fat Mike finished the next review.')
 
     def test_reply_arrives_after_send_command_times_out_and_exits(self):
         process, frame, sent = self.start_send()
