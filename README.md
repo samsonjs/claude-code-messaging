@@ -1,6 +1,6 @@
 # Claude Code Messaging
 
-A Codex skill for talking to existing Claude Code sessions on the same machine. It discovers sessions, sends messages through Claude's native inbox sockets, and dispatches persistent replies into the owning Codex chat.
+A Codex skill and optional local MCP interface for talking to existing Claude Code sessions on the same machine. It discovers sessions, sends messages through Claude's native inbox sockets, and dispatches persistent replies into the owning Codex chat.
 
 [Forgejo](https://git.samhuri.net/sjs/claude-code-messaging) is the primary repository. [GitHub](https://github.com/samsonjs/claude-code-messaging) is an automatic push mirror.
 
@@ -22,9 +22,9 @@ Ask Codex:
 
 > Use $claude-code-messaging to ask the Claude session working on the build for a status update.
 
-The full workflow is in [SKILL.md](SKILL.md).
+The full workflow is in [SKILL.md](SKILL.md). For stable per-chat addresses, Claude-side discovery, MCP tools, lifecycle hooks, and native idle subscriptions, see [local integration](references/integration.md). Run `python3 scripts/install.py` to configure the integration; it preserves your existing completion notifier and requires normal hook review.
 
-Claude's `ListAgents` and the CLI's `/peers` command list Claude sessions. This bridge does not register Codex chats there: Codex starts an exchange, and Claude replies with native `SendMessage` by copying the incoming message's `from` address into `to`. “Codex” is only the sender's display name. Claude's current tool instructions describe this reply workflow, and Claude can use its existing messaging tools without installing this skill.
+Claude's `ListAgents` and the CLI's `/peers` command list Claude sessions. This bridge does not register Codex chats there: Codex can start an exchange, and Claude replies with native `SendMessage` by copying the incoming message's `from` address into `to`. “Codex” is only the sender's display name. Claude's current tool instructions describe this reply workflow, and Claude can use its existing messaging tools without installing the Codex skill. The installed Claude-side `codex-chat-messaging` skill lets Claude discover and initiate messages to participating Codex chats.
 
 ## Reply lifetime
 
@@ -36,11 +36,11 @@ While collaborating, Codex keeps the active turn open for unfinished work, conti
 
 New inboxes automatically start a detached dispatcher when `CODEX_THREAD_ID` and a Codex CLI with the `queue` command are available. It queues replies into the owning chat: idle chats start a turn, while active chats receive a notification in their next turn. `receiver_wakes_agent` and `dispatch_status` report whether dispatch is running. `send --no-dispatch` creates a storage-only inbox. Use `dispatch --inbox UUID` from the owning chat to enable an existing inbox without changing its return address. After updating the helper, add `--restart` to replace a running dispatcher and load the new notification format while preserving its address and cursors. Notifications already queued stay in the chat.
 
-Queueing and handling have separate durable journals. A queued reply stays unread until explicitly acknowledged, and restarting dispatch does not queue it again. Replayed frames are deduplicated. Queue errors and uncertain interrupted attempts stop dispatch with their saved messages intact; handle and acknowledge the pending reply before restarting. Notifications contain only the inbox and sequence reference; `read --unread` returns the complete frames. Codex reports substantive results or blockers and silently ignores notifications for replies already handled. Local acknowledgements do not send courtesy messages back to Claude.
+Queueing and handling have separate durable journals. A queued reply stays unread until explicitly acknowledged, and restarting dispatch does not queue it again. Replayed frames are deduplicated. Queue errors and uncertain interrupted attempts stop dispatch with their saved messages intact; handle and acknowledge the pending reply before restarting. Bursts are combined into one queued notice for the highest new sequence. Notifications contain only the inbox and sequence reference; `read --unread` returns the complete frames. Codex reports substantive results or blockers and silently ignores notifications for replies already handled. Local acknowledgements do not send courtesy messages back to Claude.
 
 Keep the inbox open for later replies. Close it with `close --inbox UUID` when the person explicitly ends the exchange; this stops both receiver and dispatcher. They remain running until explicitly closed, forcibly terminated, or the machine restarts. Saved messages and acknowledgement positions survive closure. State and logs are kept under `~/.claude-scratchpad/claude-peer-bridge/`, outside the checkout. Set `CLAUDE_PEER_DATA_DIR` to isolate them elsewhere.
 
-Claude replies to the raw `uds:` return address; “Codex” is a display name, not a registered Claude session. Idle subscriptions can reach that address, but the current helper does not send idle notices.
+Claude replies to the raw `uds:` return address; “Codex” is a display name, not a registered Claude session. Native idle subscriptions can reach that address and are answered from real Codex completion events when the integration is active. Reverse subscriptions from Codex to Claude remain unsupported by the separate socket namespace; see the integration reference for host-verification limits.
 
 Dispatch uses the supported `codex queue` CLI, without a scheduled automation, another chat, or a private desktop socket. Verify automatic consumption on each host with a live peer reply arriving after a final response, without another human message. A running dispatcher alone does not prove host consumption.
 
@@ -52,6 +52,8 @@ This checkout uses jj. Run the integration tests with:
 
 ```sh
 python3 scripts/test_claude_peer.py
+python3 scripts/test_install.py
+uv run --with mcp==2.3.0 python scripts/test_mcp.py
 ```
 
 Tests exercise real local sockets and CLI processes with isolated session and queue fixtures. They cover reply lifetimes, unread tracking, dispatch routing, deduplication, restarts, uncertain delivery, failures, blocking, closure, notification size, and inbox migration. They never message live Claude or Codex sessions; real host consumption needs the separate live checks above. Forgejo CI runs the same suite.

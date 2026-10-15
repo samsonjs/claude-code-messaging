@@ -53,10 +53,10 @@ class ReplyLifetimeTests(unittest.TestCase):
         self.server.close()
         self.temp.cleanup()
 
-    def cli(self, *args):
+    def cli(self, *args, input=None):
         return subprocess.run(
             [sys.executable, str(SCRIPT), *args], env=self.env,
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, input=input,
         )
 
     def start_send(self, wait='0.05', inbox=None, no_dispatch=False):
@@ -145,6 +145,229 @@ class ReplyLifetimeTests(unittest.TestCase):
             time.sleep(0.02)
         self.fail(f'Dispatch did not reach {status}: {state}')
 
+    def test_register_reuses_chat_address_and_exposes_read_only_discovery(self):
+        self.enable_queue_fixture()
+        result = self.cli('register', '--name', 'Powder day review', '--cwd', str(self.base))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        first = json.loads(result.stdout)
+        self.inboxes.add(first['inbox'])
+        result = self.cli('register', '--name', 'Powder day review')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        second = json.loads(result.stdout)
+        self.assertEqual(second['inbox'], first['inbox'])
+        self.assertEqual(second['reply_address'], first['reply_address'])
+        discovered = self.cli('chats')
+        rows = [json.loads(line) for line in discovered.stdout.splitlines()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['name'], 'Powder day review')
+        self.assertEqual(rows[0]['cwd'], str(self.base))
+        self.assertEqual(rows[0]['reply_address'], first['reply_address'])
+        self.assertTrue(rows[0]['open'])
+        self.assertTrue(rows[0]['receiver_wakes_agent'])
+        self.assertNotIn('message', rows[0])
+
+    def test_registration_adopts_existing_exchange_and_default_sends_reuse_it(self):
+        self.enable_queue_fixture()
+        process, frame, first = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        result = self.cli('register', '--name', 'Existing chat')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        registered = json.loads(result.stdout)
+        self.assertEqual(registered['reply_address'], first['reply_address'])
+        process, _, second = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        self.assertEqual(second['inbox'], first['inbox'])
+
+    def test_reconnect_preserves_address_unread_messages_and_sequence(self):
+        self.enable_queue_fixture()
+        result = self.cli('register', '--name', 'Persistent chat')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        first = json.loads(result.stdout)
+        self.inboxes.add(first['inbox'])
+        self.reply(first['reply_address'], 'Before restart.', message_id='repeat-me')
+        self.read_messages(first['inbox'])
+        self.cli('close', '--inbox', first['inbox'])
+        result = self.cli('register')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        second = json.loads(result.stdout)
+        self.assertEqual(second['reply_address'], first['reply_address'])
+        self.reply(second['reply_address'], 'Before restart.', message_id='repeat-me')
+        self.reply(second['reply_address'], 'After restart.')
+        rows = self.read_messages(first['inbox'], after=1)
+        self.assertEqual(rows[0]['seq'], 2)
+        self.assertEqual(rows[0]['frame']['message']['content'], 'After restart.')
+        self.assertEqual(json.loads(self.cli('inboxes').stdout)['unread_count'], 2)
+
+    def test_outgoing_mode_is_explicit_and_unknown_is_not_asserted(self):
+        self.enable_queue_fixture()
+        result = self.cli('register', '--sender-mode', 'bypass')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.inboxes.add(json.loads(result.stdout)['inbox'])
+        process, frame, _ = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        self.assertEqual(frame['from_mode'], 'bypass')
+        self.assertIn('from-mode="bypass"', frame['message']['content'])
+        self.cli('register', '--sender-mode', 'unknown')
+        process, frame, _ = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        self.assertNotIn('from_mode', frame)
+        self.assertNotIn('from-mode=', frame['message']['content'])
+
+    def test_dispatch_batches_saved_burst_without_consuming_replies(self):
+        self.enable_queue_fixture()
+        process, frame, sent = self.start_send(wait='0', no_dispatch=True)
+        process.communicate(timeout=5)
+        for text in ('First finding.', 'Second finding.', 'Final finding.'):
+            self.reply(frame['from'], text)
+        self.read_messages(sent['inbox'], after=2)
+        result = self.cli('dispatch', '--inbox', sent['inbox'])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.queued()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            state = json.loads(self.cli('inboxes').stdout)
+            if state['dispatch_cursor'] == 3:
+                break
+            time.sleep(0.02)
+        self.assertEqual(state['dispatch_cursor'], 3)
+        self.assertEqual(len(self.queued()), 1)
+        self.assertIn(f"{sent['inbox']}:3", self.queued()[0][4])
+        self.assertEqual(state['unread_count'], 3)
+        self.assertEqual(state['acknowledged_cursor'], 0)
+
+    def test_idle_subscription_waits_for_completion_and_sends_one_correlated_notice(self):
+        self.enable_queue_fixture()
+        result = self.cli('register', '--sender-mode', 'prompting')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        registered = json.loads(result.stdout)
+        self.inboxes.add(registered['inbox'])
+        subscription = {'type': 'control', 'action': 'notify_when_idle', 'msgV': 1,
+                        'msg_id': str(uuid.uuid4()), 'from': 'uds:' + str(self.socket_path)}
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(registered['reply_address'].removeprefix('uds:'))
+            client.sendall((json.dumps(subscription) + '\n').encode())
+        self.read_messages(registered['inbox'])
+        self.assertFalse(self.queue_log.exists())
+        payload = json.dumps({'type': 'agent-turn-complete', 'thread-id': self.owner_thread,
+                              'turn-id': 'powder-turn', 'last-assistant-message': 'Review finished.'})
+        result = self.cli('notify', payload)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        conn, _ = self.server.accept()
+        with conn:
+            notice = json.loads(conn.recv(65536))
+        self.assertEqual(notice['action'], 'peer_idle_notice')
+        self.assertEqual(notice['orig_msg_id'], subscription['msg_id'])
+        self.assertEqual(notice['state'], 'idle')
+        self.assertIsInstance(notice['finished_at'], int)
+        self.assertEqual(notice['from'], registered['reply_address'])
+        self.assertEqual(notice['from_mode'], 'prompting')
+        self.assertEqual(self.cli('notify', payload).returncode, 0)
+        self.server.settimeout(0.2)
+        with self.assertRaises(socket.timeout):
+            self.server.accept()
+
+    def test_idle_does_not_answer_a_new_subscription_from_an_untracked_old_completion(self):
+        self.enable_queue_fixture()
+        registered = json.loads(self.cli('register').stdout)
+        self.inboxes.add(registered['inbox'])
+        complete = {'type': 'agent-turn-complete', 'thread-id': self.owner_thread,
+                    'turn-id': 'old-turn'}
+        self.cli('notify', json.dumps(complete))
+        time.sleep(0.02)
+        subscription = {'type': 'control', 'action': 'notify_when_idle', 'msgV': 1,
+                        'msg_id': str(uuid.uuid4()), 'from': 'uds:' + str(self.socket_path)}
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(registered['reply_address'].removeprefix('uds:'))
+            client.sendall((json.dumps(subscription) + '\n').encode())
+        self.read_messages(registered['inbox'])
+        self.server.settimeout(0.2)
+        with self.assertRaises(socket.timeout):
+            self.server.accept()
+        self.cli('notify', json.dumps(complete))
+        with self.assertRaises(socket.timeout):
+            self.server.accept()
+        busy = {'hook_event_name': 'UserPromptSubmit', 'session_id': self.owner_thread,
+                'turn_id': 'new-turn', 'permission_mode': 'default'}
+        self.cli('hook', input=json.dumps(busy))
+        self.cli('notify', json.dumps(complete))
+        with self.assertRaises(socket.timeout):
+            self.server.accept()
+        complete['turn-id'] = 'new-turn'
+        self.cli('notify', json.dumps(complete))
+        conn, _ = self.server.accept()
+        with conn:
+            self.assertEqual(json.loads(conn.recv(65536))['orig_msg_id'], subscription['msg_id'])
+
+    def test_register_recovers_a_killed_receiver_at_the_same_address(self):
+        self.enable_queue_fixture()
+        registered = json.loads(self.cli('register').stdout)
+        self.inboxes.add(registered['inbox'])
+        before = json.loads(self.cli('inboxes').stdout)
+        os.kill(before['pid'], signal.SIGKILL)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if not json.loads(self.cli('inboxes').stdout)['open']:
+                break
+            time.sleep(0.02)
+        result = self.cli('register')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)['reply_address'], registered['reply_address'])
+        self.reply(registered['reply_address'], 'Recovery succeeded.')
+        self.assertEqual(self.read_messages(registered['inbox'])[0]['seq'], 1)
+
+    def test_notify_also_runs_the_previously_configured_notifier(self):
+        output = self.base / 'forwarded.json'
+        executable = self.base / 'previous-notifier'
+        executable.write_text(f'#!{sys.executable}\nimport sys\nfrom pathlib import Path\n'
+                              f'Path({str(output)!r}).write_text(sys.argv[1])\n')
+        executable.chmod(0o700)
+        data = self.base / 'data'
+        data.mkdir()
+        (data / 'notify-forward.json').write_text(json.dumps([str(executable)]))
+        payload = json.dumps({'type': 'agent-turn-complete', 'thread-id': str(uuid.uuid4())})
+        result = self.cli('notify', payload)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(output.read_text()), json.loads(payload))
+
+    def test_session_start_hook_registers_a_chat_without_an_outgoing_message(self):
+        self.enable_queue_fixture()
+        event = {'hook_event_name': 'SessionStart', 'session_id': self.owner_thread,
+                 'cwd': str(self.base), 'permission_mode': 'bypassPermissions'}
+        self.env.pop('CODEX_THREAD_ID')
+        result = self.cli('hook', input=json.dumps(event))
+        self.env['CODEX_THREAD_ID'] = self.owner_thread
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        chats = [json.loads(line) for line in self.cli('chats').stdout.splitlines()]
+        self.assertEqual(len(chats), 1)
+        state = json.loads(self.cli('inboxes').stdout)
+        self.inboxes.add(state['inbox'])
+        self.assertTrue(chats[0]['receiver_wakes_agent'])
+        self.assertEqual(chats[0]['cwd'], str(self.base))
+        process, frame, sent = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        self.assertEqual(frame['from_mode'], 'bypass')
+        self.assertEqual(sent['reply_address'], chats[0]['reply_address'])
+
+    def test_tracked_idle_answers_immediately_without_waking_the_codex_chat(self):
+        self.enable_queue_fixture()
+        registered = json.loads(self.cli('register').stdout)
+        self.inboxes.add(registered['inbox'])
+        self.cli('hook', input=json.dumps({'hook_event_name': 'UserPromptSubmit',
+                                          'session_id': self.owner_thread, 'turn_id': 'tracked'}))
+        self.cli('notify', json.dumps({'type': 'agent-turn-complete',
+                                      'thread-id': self.owner_thread, 'turn-id': 'tracked'}))
+        subscription = {'type': 'control', 'action': 'notify_when_idle', 'msgV': 1,
+                        'msg_id': str(uuid.uuid4()), 'from': 'uds:' + str(self.socket_path)}
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(registered['reply_address'].removeprefix('uds:'))
+            client.sendall((json.dumps(subscription) + '\n').encode())
+        conn, _ = self.server.accept()
+        with conn:
+            notice = json.loads(conn.recv(65536))
+        self.assertEqual(notice['orig_msg_id'], subscription['msg_id'])
+        self.assertEqual(notice['state'], 'idle')
+        self.assertFalse(self.queue_log.exists())
+
     def test_receiver_queues_later_reply_to_owner_without_acknowledging(self):
         self.enable_queue_fixture()
         process, frame, sent = self.start_send(wait='0')
@@ -169,11 +392,11 @@ class ReplyLifetimeTests(unittest.TestCase):
         for _ in range(2):
             self.reply(frame['from'], 'Trent finished the review.', message_id=message_id)
         self.reply(frame['from'], 'Fat Mike has another result.')
-        queued = self.queued(count=2)
+        queued = self.queued()
         rows = self.read_messages(sent['inbox'])
         self.assertEqual(len([row for row in rows if row['event'] == 'received']), 2)
-        self.assertEqual(len(queued), 2)
-        self.assertIn(f"{sent['inbox']}:2", queued[1][4])
+        self.assertEqual(len(queued), 1)
+        self.assertIn(f"{sent['inbox']}:2", queued[0][4])
 
     def test_interrupted_queue_attempt_stays_unread_and_is_not_retried(self):
         self.enable_queue_fixture()

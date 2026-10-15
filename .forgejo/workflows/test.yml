@@ -14,7 +14,7 @@ jobs:
   test:
     runs-on: docker
     container:
-      image: docker.io/library/ruby:4.0.5
+      image: docker.io/library/python:3.12
     timeout-minutes: 5
     steps:
       - name: Check out
@@ -32,6 +32,14 @@ jobs:
 
       - name: Test reply inboxes
         run: python3 scripts/test_claude_peer.py
+
+      - name: Test installation
+        run: python3 scripts/test_install.py
+
+      - name: Test MCP tools
+        run: |
+          python3 -m pip install --disable-pip-version-check mcp==2.3.0
+          python3 scripts/test_mcp.py
 
   workflows:
     name: Lint workflows

@@ -119,16 +119,20 @@ def reply_socket_path(inbox):
     return path
 
 
-def start_inbox(no_dispatch=False):
-    inbox = str(uuid.uuid4())
+def start_inbox(no_dispatch=False, inbox=None, owner=None):
+    inbox = inbox or str(uuid.uuid4())
     reply_socket_path(inbox)
     directory = inbox_directory(inbox)
-    directory.mkdir(parents=True, mode=0o700)
-    write_state(directory, {
-        'inbox': inbox, 'status': 'starting', 'created_at': now(),
-        'socket_directory': str(sockets_root()),
-        'owner_thread': os.environ.get('CODEX_THREAD_ID'),
-    })
+    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    state = inbox_state(inbox) if (directory / 'state.json').exists() else {
+        'inbox': inbox, 'created_at': now(), 'socket_directory': str(sockets_root()),
+        'owner_thread': owner or os.environ.get('CODEX_THREAD_ID'),
+    }
+    if inbox_open(state):
+        return state
+    (directory / 'stop').unlink(missing_ok=True)
+    state.update(status='starting')
+    write_state(directory, state)
     with (directory / 'receiver.stderr').open('a') as errors:
         process = subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), '_serve', '--inbox', inbox],
@@ -147,6 +151,228 @@ def start_inbox(no_dispatch=False):
         time.sleep(0.02)
     (directory / 'stop').touch()
     raise ValueError(f'Inbox startup timed out: {inbox}')
+
+
+def chat_path(owner):
+    if str(uuid.UUID(owner)) != owner:
+        raise ValueError('Chat owner must be a canonical Codex thread UUID')
+    return OUTPUT / 'chats' / f'{owner}.json'
+
+
+def chat_record(owner):
+    path = chat_path(owner)
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def register_chat(name=None, cwd=None, no_dispatch=False, sender_mode=None, owner=None):
+    owner = owner or os.environ.get('CODEX_THREAD_ID')
+    if not owner:
+        raise ValueError('Register must run in a Codex chat with CODEX_THREAD_ID')
+    path = chat_path(owner)
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    with path.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        record = chat_record(owner)
+        if record is None:
+            candidates = []
+            for existing in (OUTPUT / 'inboxes').glob('*/state.json'):
+                state = json.loads(existing.read_text())
+                if (state.get('owner_thread') == owner and inbox_open(state) and
+                        Path(state['socket_path']).parent == sockets_root()):
+                    candidates.append(state)
+            candidates.sort(key=lambda state: state['created_at'])
+            inbox = (candidates[0]['inbox'] if candidates else
+                     str(uuid.uuid5(uuid.NAMESPACE_URL, f'{OUTPUT}:{owner}')))
+            record = {'owner_thread': owner, 'inbox': inbox,
+                      'name': name or f'Codex {owner[:8]}',
+                      'cwd': str(Path(cwd or Path.cwd()).resolve())}
+        if name is not None:
+            if not name.strip() or len(name) > 200:
+                raise ValueError('Chat name must contain 1–200 characters')
+            record['name'] = name.strip()
+        if cwd is not None:
+            record['cwd'] = str(Path(cwd).resolve())
+        if sender_mode is not None:
+            record['sender_mode'] = sender_mode
+        write_json(path, record)
+        set_activity(owner, 'busy')
+        state = start_inbox(True, inbox=record['inbox'], owner=owner)
+        if not no_dispatch:
+            start_dispatch(state['inbox'], caller=owner)
+        return {**record, 'reply_address': state['reply_address'], 'open': inbox_open(state),
+                **dispatch_details(state['inbox'])}
+
+
+def discover_chats(include_closed=False):
+    for path in sorted((OUTPUT / 'chats').glob('*.json')):
+        record = json.loads(path.read_text())
+        state = inbox_state(record['inbox'])
+        opened = inbox_open(state)
+        if opened or include_closed:
+            activity = activity_state(record['owner_thread'])
+            yield {key: value for key, value in {
+                'name': record['name'], 'cwd': record['cwd'],
+                'reply_address': state.get('reply_address'), 'open': opened,
+                'receiver_wakes_agent': dispatch_details(state['inbox'])['receiver_wakes_agent'],
+                'activity': activity.get('state', 'unknown'),
+            }.items()}
+
+
+def activity_state(owner):
+    chat_path(owner)
+    path = OUTPUT / 'lifecycle' / f'{owner}.json'
+    return json.loads(path.read_text()) if path.exists() else {'state': 'unknown'}
+
+
+def set_activity(owner, state, turn_id=None, detail=None, tracked=False):
+    path = OUTPUT / 'lifecycle' / f'{owner}.json'
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    with path.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        previous = activity_state(owner)
+        completed = previous.get('completed_turns', [])
+        if state == 'idle' and turn_id and turn_id in completed:
+            return previous
+        if (state == 'idle' and previous.get('state') == 'busy' and
+                previous.get('turn_id') and turn_id and previous['turn_id'] != turn_id):
+            return previous
+        record = {'state': state, 'turn_id': turn_id, 'updated_at': now(),
+                  'tracked': tracked or previous.get('tracked', False),
+                  'completed_turns': completed}
+        if state == 'idle':
+            record.update(finished_at=int(time.time() * 1000),
+                          detail=(detail or '').split('\n', 1)[0][:200])
+            if turn_id:
+                record['completed_turns'] = [*completed, turn_id][-128:]
+        write_json(path, record)
+        return record
+
+
+def mark_active(state):
+    owner = state.get('owner_thread')
+    if owner and owner == os.environ.get('CODEX_THREAD_ID'):
+        set_activity(owner, 'busy')
+
+
+def idle_subscriptions(inbox, frame=None):
+    directory = inbox_directory(inbox)
+    path = directory / 'idle.json'
+    with (directory / 'idle.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        subscriptions = json.loads(path.read_text()) if path.exists() else {}
+        if frame is not None:
+            address = frame.get('from', '')
+            message_id = frame.get('msg_id')
+            if not isinstance(address, str) or not isinstance(message_id, str) or not message_id:
+                return
+            target = next((s for s in sessions()
+                           if address == 'uds:' + s['messagingSocketPath']), None)
+            if target is None:
+                return
+            private_socket(Path(target['messagingSocketPath']))
+            key = json.dumps([address, message_id])
+            subscriptions.setdefault(key, {'from': address, 'msg_id': message_id,
+                                           'session_id': target['sessionId'],
+                                           'created_at': time.time(), 'status': 'pending'})
+            write_json(path, subscriptions)
+        state = inbox_state(inbox)
+        owner = state.get('owner_thread')
+        if not owner:
+            return
+        activity = activity_state(owner)
+        if activity['state'] not in {'idle', 'exited'}:
+            return
+        if any(row['frame'].get('type') == 'user'
+               for row in messages(inbox, acknowledged_cursor(inbox))):
+            return
+        chat = chat_record(owner) or {}
+        for entry in subscriptions.values():
+            if entry['status'] != 'pending':
+                continue
+            if time.time() - entry['created_at'] >= 12 * 3600:
+                entry['status'] = 'expired'
+                continue
+            if (activity['state'] == 'idle' and not activity.get('tracked') and
+                    entry['created_at'] * 1000 > activity['finished_at']):
+                continue
+            target = next((s for s in sessions()
+                           if entry['from'] == 'uds:' + s['messagingSocketPath'] and
+                           entry['session_id'] == s['sessionId']), None)
+            if target is None:
+                entry['status'] = 'unavailable'
+                continue
+            notice = {'type': 'control', 'action': 'peer_idle_notice', 'msgV': 1,
+                      'msg_id': str(uuid.uuid4()), 'orig_msg_id': entry['msg_id'],
+                      'state': activity['state'], 'from': state['reply_address']}
+            for field in ('finished_at', 'detail'):
+                if field in activity:
+                    notice[field] = activity[field]
+            if chat.get('sender_mode') in {'prompting', 'bypass'}:
+                notice['from_mode'] = chat['sender_mode']
+            entry.update(status='uncertain', notice=notice, attempted_at=now())
+            write_json(path, subscriptions)
+            try:
+                socket_path = Path(target['messagingSocketPath'])
+                private_socket(socket_path)
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.settimeout(1)
+                    client.connect(str(socket_path))
+                    client.sendall((json.dumps(notice) + '\n').encode())
+                entry['status'] = 'sent'
+            except (OSError, ValueError) as error:
+                entry['error'] = str(error)
+            write_json(path, subscriptions)
+        write_json(path, subscriptions)
+
+
+def lifecycle(payload):
+    owner = payload.get('session_id') or payload.get('thread-id')
+    if not owner:
+        return
+    event = payload.get('hook_event_name') or payload.get('type')
+    if event == 'SessionStart':
+        bound = os.environ.get('CODEX_THREAD_ID')
+        if bound and bound != owner:
+            raise ValueError('SessionStart identity does not match the calling chat')
+        existing = chat_record(owner)
+        cwd = payload.get('cwd')
+        label = f'Codex {Path(cwd).name} {owner[:8]}' if cwd else None
+        register_chat(name=None if existing else label, cwd=cwd, owner=owner)
+    if not chat_record(owner):
+        return
+    turn_id = payload.get('turn_id') or payload.get('turn-id')
+    permission = payload.get('permission_mode')
+    mode = {'bypassPermissions': 'bypass', 'default': 'prompting',
+            'acceptEdits': 'prompting', 'dontAsk': 'prompting', 'plan': 'unknown'}.get(permission)
+    if mode:
+        path = chat_path(owner)
+        with path.with_suffix('.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            record = chat_record(owner)
+            record['sender_mode'] = mode
+            write_json(path, record)
+    if event in {'UserPromptSubmit', 'SessionStart'}:
+        set_activity(owner, 'busy', turn_id, tracked=True)
+    elif event == 'agent-turn-complete':
+        set_activity(owner, 'idle', turn_id, payload.get('last-assistant-message'))
+    elif event in {'Interrupt', 'SessionEnd'}:
+        set_activity(owner, 'exited' if event == 'SessionEnd' else 'unknown', turn_id)
+    for path in (OUTPUT / 'inboxes').glob('*/state.json'):
+        state = json.loads(path.read_text())
+        if state.get('owner_thread') == owner:
+            idle_subscriptions(state['inbox'])
+
+
+def notify(payload):
+    try:
+        lifecycle(json.loads(payload))
+    finally:
+        path = OUTPUT / 'notify-forward.json'
+        if path.exists():
+            command = json.loads(path.read_text())
+            if command:
+                subprocess.run([*command, payload], timeout=10, check=False,
+                               stdout=subprocess.DEVNULL)
 
 
 def dispatch_state(inbox):
@@ -173,10 +399,10 @@ def dispatch_details(inbox):
             'dispatch_error': state.get('error'), 'dispatch_pending': state.get('pending')}
 
 
-def start_dispatch(inbox, restart=False):
+def start_dispatch(inbox, restart=False, caller=None):
     directory = inbox_directory(inbox)
     owner = inbox_state(inbox).get('owner_thread')
-    if not owner or owner != os.environ.get('CODEX_THREAD_ID'):
+    if not owner or owner != (caller or os.environ.get('CODEX_THREAD_ID')):
         raise ValueError('Dispatch must be enabled from the inbox\'s owning Codex chat')
     if not inbox_open(inbox_state(inbox)):
         raise ValueError('Cannot dispatch from a closed or unavailable reply inbox')
@@ -241,28 +467,39 @@ def dispatch_loop(inbox):
         write_json(path, state)
         try:
             while not (directory / 'stop').exists():
-                for row in messages(inbox, state['cursor']):
+                rows = messages(inbox, state['cursor'])
+                if not rows:
+                    time.sleep(0.1)
+                    continue
+                time.sleep(0.15)
+                rows = messages(inbox, state['cursor'])
+                acknowledged = acknowledged_cursor(inbox)
+                eligible = []
+                keys = []
+                for row in rows:
                     frame = row['frame']
                     key = json.dumps([frame.get('from'), frame.get('msg_id') or row['seq']])
-                    if (row['seq'] <= acknowledged_cursor(inbox) or
-                            frame.get('type') != 'user' or key in state['keys']):
-                        state['cursor'] = row['seq']
-                        write_json(path, state)
-                        continue
-                    state['pending'] = {'seq': row['seq'], 'key': key, 'at': now()}
+                    if (row['seq'] > acknowledged and frame.get('type') == 'user' and
+                            key not in state['keys'] and key not in keys):
+                        eligible.append(row)
+                        keys.append(key)
+                if eligible:
+                    state['pending'] = {'seq': rows[-1]['seq'], 'key': keys[-1], 'keys': keys,
+                                        'first_seq': eligible[0]['seq'], 'at': now()}
                     write_json(path, state)
                     result = subprocess.run(
                         [state['executable'], 'queue', '--thread', state['owner_thread'],
-                         '--message', dispatch_prompt(row)],
+                         '--message', dispatch_prompt(eligible[-1])],
                         capture_output=True, text=True, timeout=15,
                     )
                     if result.returncode:
                         raise ValueError((result.stderr or result.stdout).strip()[:2000] or
                                          f'codex queue exited {result.returncode}')
-                    state['keys'].append(key)
-                    state.update(cursor=row['seq'], pending=None, last_queued_at=now(),
+                    state['keys'].extend(keys)
+                    state.update(pending=None, last_queued_at=now(),
                                  receipt=result.stdout.strip()[:2000])
-                    write_json(path, state)
+                state['cursor'] = rows[-1]['seq']
+                write_json(path, state)
                 time.sleep(0.1)
         except Exception as error:
             state.update(status='error', error=str(error))
@@ -311,14 +548,33 @@ def serve(inbox):
     log = directory / 'messages.jsonl'
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     bound = False
-    sequence = 0
-    seen = set()
+    history = messages(inbox, 0)
+    sequence = history[-1]['seq'] if history else 0
+    seen = {json.dumps([row['frame'].get('from'), row['frame']['msg_id']])
+            for row in history if row['frame'].get('msg_id')}
+    guard = (directory / 'receiver.lock').open('a')
+    try:
+        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        guard.close()
+        return 0
 
     def interrupted(*_):
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, interrupted)
     try:
+        if path.exists():
+            private_socket(path)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.2)
+                try:
+                    probe.connect(str(path))
+                except (ConnectionRefusedError, FileNotFoundError):
+                    pass
+                else:
+                    raise ValueError('Reply address already has a listener; refusing to replace it')
+            path.unlink(missing_ok=True)
         listener.bind(str(path))
         bound = True
         path.chmod(0o600)
@@ -363,6 +619,15 @@ def serve(inbox):
                         sequence += 1
                         append(log, {'at': now(), 'event': 'received', 'inbox': inbox,
                                      'seq': sequence, 'frame': frame})
+                        if frame.get('type') == 'user' and state.get('owner_thread'):
+                            set_activity(state['owner_thread'], 'busy')
+                        elif (frame.get('type') == 'control' and
+                              frame.get('action') == 'notify_when_idle'):
+                            try:
+                                idle_subscriptions(inbox, frame)
+                            except (OSError, ValueError) as error:
+                                append(directory / 'idle-errors.jsonl',
+                                       {'at': now(), 'error': str(error)})
     except KeyboardInterrupt:
         pass
     except Exception as error:
@@ -376,6 +641,7 @@ def serve(inbox):
             state['status'] = 'closed'
         state['closed_at'] = now()
         write_state(directory, state)
+        guard.close()
     return 0
 
 
@@ -403,7 +669,7 @@ def acknowledged_cursor(inbox):
 
 def acknowledge(inbox, through):
     directory = inbox_directory(inbox)
-    inbox_state(inbox)
+    mark_active(inbox_state(inbox))
     with (directory / 'acknowledged.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         previous = acknowledged_cursor(inbox)
@@ -438,7 +704,12 @@ def send(args):
     # Reject oversized messages before starting a background receiver.
     if len(text.encode()) > 60000:
         raise ValueError('Message exceeds this bridge\'s 60 KiB text limit')
-    state = inbox_state(args.inbox) if args.inbox else start_inbox(args.no_dispatch)
+    if args.inbox:
+        state = inbox_state(args.inbox)
+    elif os.environ.get('CODEX_THREAD_ID'):
+        state = inbox_state(register_chat(no_dispatch=args.no_dispatch)['inbox'])
+    else:
+        state = start_inbox(args.no_dispatch)
     if not inbox_open(state):
         raise ValueError('Reply inbox is closed or unavailable; send using a new inbox')
     inbox = state['inbox']
@@ -454,8 +725,11 @@ def send(args):
         emit(entry)
 
     body = text.replace('</cross-session-message', '<\\/cross-session-message')
+    chat = chat_record(state['owner_thread']) if state.get('owner_thread') else None
+    mode = (chat or {}).get('sender_mode')
+    mode_attribute = f' from-mode="{mode}"' if mode in {'prompting', 'bypass'} else ''
     content = (
-        f'<cross-session-message from="{address}" from-name="Codex">\n'
+        f'<cross-session-message from="{address}" from-name="Codex"{mode_attribute}>\n'
         f'{body}\n</cross-session-message>'
     )
     frame = {
@@ -463,6 +737,8 @@ def send(args):
         'message': {'role': 'user', 'content': content}, 'priority': 'next',
         'session_id': target['sessionId'], 'from': address,
     }
+    if mode in {'prompting', 'bypass'}:
+        frame['from_mode'] = mode
     wire = (json.dumps(frame, ensure_ascii=False) + '\n').encode()
     if len(wire) > 65536:
         raise ValueError('Encoded message exceeds this bridge\'s 64 KiB limit')
@@ -545,6 +821,16 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('list', help='Discover running Claude Code sessions')
     sub.add_parser('inboxes', help='List saved reply inboxes')
+    registration = sub.add_parser('register', help='Register or reconnect this Codex chat')
+    registration.add_argument('--name', help='Human-readable chat label')
+    registration.add_argument('--cwd', help='Chat working directory')
+    registration.add_argument('--no-dispatch', action='store_true')
+    registration.add_argument('--sender-mode', choices=('prompting', 'bypass', 'unknown'))
+    discovery = sub.add_parser('chats', help='Read-only discovery of registered Codex chats')
+    discovery.add_argument('--all', action='store_true', help='Include offline chats')
+    notifier = sub.add_parser('notify', help='Codex turn-completion notification handler')
+    notifier.add_argument('payload', help='JSON payload supplied by Codex')
+    sub.add_parser('hook', help='Read a Codex lifecycle hook event from stdin')
     post = sub.add_parser('send', help='Send with a persistent return address')
     post.add_argument('--pid', type=int, required=True)
     post.add_argument('--message', required=True, help='Text, or - to read stdin')
@@ -574,6 +860,20 @@ def main():
     receiver = sub.add_parser('_serve', help=argparse.SUPPRESS)
     receiver.add_argument('--inbox', required=True)
     args = parser.parse_args()
+    if args.command == 'notify':
+        notify(args.payload)
+        return 0
+    if args.command == 'hook':
+        lifecycle(json.load(sys.stdin))
+        emit({})
+        return 0
+    if args.command == 'register':
+        emit(register_chat(args.name, args.cwd, args.no_dispatch, args.sender_mode))
+        return 0
+    if args.command == 'chats':
+        for chat in discover_chats(args.all):
+            emit(chat)
+        return 0
     if args.command == 'list':
         for entry in sessions():
             emit({k: entry.get(k) for k in
