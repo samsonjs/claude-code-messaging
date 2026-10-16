@@ -66,5 +66,7 @@ A round trip using the helper and Claude's native `SendMessage` was verified wit
 
 Live acceptance on 2026-10-15 also verified the MCP path after switching Codex to Approve for me: the next real prompt updated the sender declaration to `prompting`, Claude's Auto session received a fresh token without a hold, and its native replies returned the token and two separate burst messages to the same inbox. Claude independently confirmed discovery contained only the six intentionally registered chats, with distinct identifiers and declared modes in `chats --all`. Reading preserved unread replies; acknowledgement cleared only the handled sequences.
 
+The delayed-reply check also passed: Claude observed this Codex chat become idle at 19:19:28 PDT, sent its one native test message at 19:19:32, and the owning chat resumed at 19:19:34 without human input. Claude used a bounded discovery check to observe idle; this verifies reply-triggered wakeup, not native idle subscriptions.
+
 - [Anthropic's cross-session messaging documentation](https://code.claude.com/docs/en/cross-session-messaging)
 - [Independent Go implementation of the socket transport](https://github.com/PeterSR/claude-code-socket-transport)
