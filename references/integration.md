@@ -52,6 +52,8 @@ Pass the current chat's `CODEX_THREAD_ID` as `thread_id`, never an ID copied fro
 
 `from_mode` is `prompting`, `bypass`, or omitted when unknown. Trusted lifecycle events update it from the host's permission mode: `bypassPermissions` reports `bypass`, while `default`, `acceptEdits`, `auto`, and `dontAsk` report `prompting`, matching [Anthropic's messaging classes](https://code.claude.com/docs/en/cross-session-messaging#control-incoming-messages). Plan mode or an unrecognised mode clears an earlier declaration to unknown; completion events without a permission field preserve the known mode. Registration also accepts `--sender-mode` when the actual runtime policy is known. Do not infer a chat's current policy from global defaults or select a mode to avoid an inbound hold.
 
+Mode changes refresh on the next genuine host prompt or session-start event. Changing the permission menu while a turn is running does not change the permissions that turn started with; follow-up messages can still steer that same turn. Finish it and start a new turn before testing the new mode. Re-registering without a newly established mode preserves the previous declaration; it does not discover the selected menu value.
+
 A known bypass sender is held by a prompting Claude session under native defaults. Claude Desktop cannot display the terminal approval dialog, so a default-held message can expire. Receipts may not return to this bridge's socket namespace. `sent` remains proof of socket transmission, not proof of admission. Preserve the receiving session's controls; do not change permissions or downgrade the asserted mode to make delivery pass.
 
 ## Idle notifications

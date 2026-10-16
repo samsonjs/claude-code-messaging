@@ -64,5 +64,7 @@ Push changes to `origin` on Forgejo. Forgejo mirrors updates to GitHub automatic
 
 A round trip using the helper and Claude's native `SendMessage` was verified with Claude Code 2.1.299 on macOS on 2026-10-15. Claude received both messages and replied to the persistent inbox, while confirming Codex was absent from `ListAgents`. The wire format remains an implementation detail that may change with Claude updates.
 
+Live acceptance on 2026-10-15 also verified the MCP path after switching Codex to Approve for me: the next real prompt updated the sender declaration to `prompting`, Claude's Auto session received a fresh token without a hold, and its native replies returned the token and two separate burst messages to the same inbox. Claude independently confirmed discovery contained only the six intentionally registered chats, with distinct identifiers and declared modes in `chats --all`. Reading preserved unread replies; acknowledgement cleared only the handled sequences.
+
 - [Anthropic's cross-session messaging documentation](https://code.claude.com/docs/en/cross-session-messaging)
 - [Independent Go implementation of the socket transport](https://github.com/PeterSR/claude-code-socket-transport)
