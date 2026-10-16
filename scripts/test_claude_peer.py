@@ -401,6 +401,24 @@ class ReplyLifetimeTests(unittest.TestCase):
         self.assertEqual(self.cli('chats').stdout.strip(), '')
         self.assertEqual(self.cli('inboxes').stdout.strip(), '')
 
+    def test_storage_only_registration_preserves_dispatch_choice_on_send_and_resume(self):
+        self.enable_queue_fixture()
+        registered = json.loads(self.cli('register', '--no-dispatch').stdout)
+        self.inboxes.add(registered['inbox'])
+        process, _, _ = self.start_send(wait='0')
+        process.communicate(timeout=5)
+        event = {'hook_event_name': 'SessionStart', 'session_id': self.owner_thread,
+                 'cwd': str(self.base), 'permission_mode': 'default'}
+        self.assertEqual(self.cli('hook', input=json.dumps(event)).returncode, 0)
+        self.assertFalse(json.loads(self.cli('inboxes').stdout)['receiver_wakes_agent'])
+        self.assertFalse(self.queue_log.exists())
+        self.assertEqual(self.cli('dispatch', '--inbox', registered['inbox']).returncode, 0)
+        os.kill(json.loads(self.cli('inboxes').stdout)['pid'], signal.SIGKILL)
+        self.assertEqual(self.cli('hook', input=json.dumps(event)).returncode, 0)
+        self.assertTrue(json.loads(self.cli('inboxes').stdout)['receiver_wakes_agent'])
+        self.reply(registered['reply_address'], 'Dispatch now enabled explicitly.')
+        self.assertEqual(len(self.queued()), 1)
+
     def test_session_start_reconnects_only_an_already_registered_chat(self):
         self.enable_queue_fixture()
         registered = json.loads(self.cli('register', '--name', 'Powder planning').stdout)

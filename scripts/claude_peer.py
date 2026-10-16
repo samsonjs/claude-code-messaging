@@ -169,7 +169,7 @@ def chat_record(owner):
     return json.loads(path.read_text()) if path.exists() else None
 
 
-def register_chat(name=None, cwd=None, no_dispatch=False, sender_mode=None, owner=None):
+def register_chat(name=None, cwd=None, no_dispatch=None, sender_mode=None, owner=None):
     owner = owner or os.environ.get('CODEX_THREAD_ID')
     if not owner:
         raise ValueError('Register must run in a Codex chat with CODEX_THREAD_ID')
@@ -178,6 +178,7 @@ def register_chat(name=None, cwd=None, no_dispatch=False, sender_mode=None, owne
     with path.with_suffix('.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         record = chat_record(owner)
+        newly_registered = record is None
         if record is None:
             candidates = []
             for existing in (OUTPUT / 'inboxes').glob('*/state.json'):
@@ -199,11 +200,15 @@ def register_chat(name=None, cwd=None, no_dispatch=False, sender_mode=None, owne
             record['cwd'] = str(Path(cwd).resolve())
         if sender_mode is not None:
             record['sender_mode'] = sender_mode
+        dispatch_enabled = (not no_dispatch if no_dispatch is not None else
+                            record.get('dispatch_enabled', newly_registered or
+                                       dispatch_state(record['inbox']) is not None))
+        record['dispatch_enabled'] = dispatch_enabled
         record['participating'] = True
         write_json(path, record)
         set_activity(owner, 'busy')
         state = start_inbox(True, inbox=record['inbox'], owner=owner)
-        if not no_dispatch:
+        if dispatch_enabled:
             start_dispatch(state['inbox'], caller=owner)
         return {**record, 'reply_address': state['reply_address'], 'open': inbox_open(state),
                 **dispatch_details(state['inbox'])}
@@ -727,7 +732,9 @@ def send(args):
     if args.inbox:
         state = inbox_state(args.inbox)
     elif os.environ.get('CODEX_THREAD_ID'):
-        state = inbox_state(register_chat(no_dispatch=args.no_dispatch)['inbox'])
+        existing = chat_record(os.environ['CODEX_THREAD_ID'])
+        state = inbox_state(register_chat(
+            no_dispatch=None if existing else args.no_dispatch)['inbox'])
     else:
         state = start_inbox(args.no_dispatch)
     if not inbox_open(state):
@@ -921,6 +928,15 @@ def main():
         return dispatch_loop(args.inbox)
     if args.command == 'dispatch':
         start_dispatch(args.inbox, restart=args.restart)
+        owner = inbox_state(args.inbox)['owner_thread']
+        path = chat_path(owner)
+        if path.exists():
+            with path.with_suffix('.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                record = chat_record(owner)
+                if record['inbox'] == args.inbox:
+                    record['dispatch_enabled'] = True
+                    write_json(path, record)
         emit({'event': 'dispatch_started', 'inbox': args.inbox, **dispatch_details(args.inbox)})
         return 0
     OUTPUT.mkdir(parents=True, exist_ok=True, mode=0o700)

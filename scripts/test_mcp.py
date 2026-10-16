@@ -27,6 +27,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory(dir=Path.home() / '.claude-scratchpad') as directory:
             owner = str(uuid.uuid4())
             env = {**os.environ, 'CODEX_THREAD_ID': owner,
+                   'PATH': directory,
                    'CLAUDE_CONFIG_DIR': directory,
                    'CLAUDE_PEER_DATA_DIR': str(Path(directory) / 'data')}
             inbox = None
@@ -71,9 +72,16 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(sent.structured_content['inbox'], inbox)
                     finally:
                         target.close()
+                    resumed = subprocess.run(
+                        [sys.executable, str(DIRECTORY / 'claude_peer.py'), 'hook'], env=env,
+                        input=json.dumps({'hook_event_name': 'SessionStart', 'session_id': owner,
+                                          'cwd': directory}), capture_output=True, text=True,
+                    )
+                    self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
                     peers = await client.call_tool('list_peers', {})
                     self.assertEqual((peers.structured_content or json.loads(peers.content[0].text))['codex_chats'][0]['name'],
                                      'MCP powder review')
+                    self.assertFalse(peers.structured_content['codex_chats'][0]['receiver_wakes_agent'])
                     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sender:
                         sender.connect(registration['reply_address'].removeprefix('uds:'))
                         sender.sendall((json.dumps({'type': 'user', 'from': 'fixture',
